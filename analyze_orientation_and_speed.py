@@ -183,28 +183,22 @@ def find_target_and_angle(frame_bgr):
     return (cx, cy, x, y, w, h, angle_deg, cnt)
 
 
-def draw_rotated_fixed_box(frame, center, angle_deg, mm_per_px, color=(0,0,255), thickness=2):
-    """
-    在 frame 疊加固定實體尺寸（9mm×6mm）的旋轉紅框。
-    center: (cx, cy) in px
-    angle_deg: 朝向角（度）
-    """
-    if mm_per_px is None or mm_per_px <= 0:
-        return frame
-    # 以 mm 轉 px
-    w_px = BOX_W_MM / mm_per_px
-    h_px = BOX_H_MM / mm_per_px
-
-    rect = (center, (w_px, h_px), angle_deg)
-    box = cv2.boxPoints(rect)              # 4×2 float
-    box = np.int32(np.round(box))          # 避免使用棄用的 np.int0
-    cv2.drawContours(frame, [box], 0, color, thickness)
-    return frame
+def create_output_directory(video_path):
+    """建立輸出資料夾"""
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    output_dir = f"{base_name}_analysis_output"
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    return output_dir
 
 
 def main():
     if not os.path.exists(VIDEO_PATH):
         raise FileNotFoundError(f"找不到影片：{VIDEO_PATH}")
+
+    # 建立輸出資料夾
+    output_dir = create_output_directory(VIDEO_PATH)
+    print(f"[資訊] 輸出資料夾：{output_dir}")
 
     cap = cv2.VideoCapture(VIDEO_PATH)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -224,7 +218,7 @@ def main():
         mm_per_px = 0.1   # 偵測不到格線時的暫定值（可換成你的校正值）
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out_path = f"{OUT_PREFIX}_rot_tracked.mp4"
+    out_path = os.path.join(output_dir, f"{OUT_PREFIX}_rot_tracked.mp4")
     writer = cv2.VideoWriter(out_path, fourcc, max(5.0, fps/PROCESS_EVERY_N), (W, H))
 
     # Kalman init（追蹤中心點）
@@ -261,10 +255,11 @@ def main():
             est = kf.correct(np.array([[cx],[cy]], dtype=np.float32))
             fx, fy = float(est[0,0]), float(est[1,0])
 
-            # 疊加固定尺寸旋轉紅框
-            frame = draw_rotated_fixed_box(frame, (fx, fy), angle_deg, mm_per_px, color=(0,0,255), thickness=2)
-            # 中心點
-            cv2.circle(frame, (int(round(fx)), int(round(fy))), 5, (0,255,0), -1)
+            # 顯示偵測到的原始輪廓（紅色線條）- 可調整粗細
+            cv2.drawContours(frame, [cnt], -1, (0, 0, 255), 4)  # 改成3讓紅框更粗
+            
+            # 中心點（綠色）- 可調整大小
+            cv2.circle(frame, (int(round(fx)), int(round(fy))), 6, (0,255,0), -1)  # 改成6讓綠點更大
         else:
             fx = fy = np.nan
 
@@ -318,25 +313,26 @@ def main():
         ang_vel = moving_average(ang_vel, SMOOTH_WIN_ANGLE)
     df["angular_vel_dps"] = ang_vel
 
-    # 輸出 CSV
-    csv_path = f"{OUT_PREFIX}_pos_angle.csv"
+    # 輸出 CSV 到資料夾
+    csv_path = os.path.join(output_dir, f"{OUT_PREFIX}_pos_angle.csv")
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    print(f"[輸出] 疊圖影片：{out_path}")
-    print(f"[輸出] CSV：{csv_path}")
+    
+    print(f"[輸出] 追蹤影片：{out_path}")
+    print(f"[輸出] 數據 CSV：{csv_path}")
     print(f"[資訊] 使用 mm/px ≈ {df['mm_per_px'].dropna().iloc[0]:.6f}")
 
     # =============== 視覺化（新版） ===============
     # 建立 1×2 subplot：左=位置，右=角速度
-    fig, (ax_pos, ax_w) = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
+    fig, (ax_pos, ax_w) = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
 
     # ---- 左：位置軌跡 ----
-    ax_pos.plot(df["x_mm"], df["y_mm"], lw=2, label="Trajectory")
+    ax_pos.plot(df["x_mm"], df["y_mm"], lw=2, label="Trajectory", color='blue')
     valid_pos = df[["x_mm", "y_mm"]].dropna()
     if len(valid_pos) > 0:
         x_start, y_start = valid_pos.iloc[0]["x_mm"], valid_pos.iloc[0]["y_mm"]
         x_end,   y_end   = valid_pos.iloc[-1]["x_mm"], valid_pos.iloc[-1]["y_mm"]
-        ax_pos.scatter([x_start], [y_start], s=80, c="green", marker="o", label="Start")
-        ax_pos.scatter([x_end],   [y_end],   s=80, c="red",   marker="o", label="End")
+        ax_pos.scatter([x_start], [y_start], s=100, c="green", marker="o", label="Start", zorder=5)
+        ax_pos.scatter([x_end],   [y_end],   s=100, c="red",   marker="o", label="End", zorder=5)
 
     ax_pos.set_aspect("equal", adjustable="box")
     if len(valid_pos) > 0:
@@ -360,15 +356,19 @@ def main():
     ax_pos.legend(loc="best")
 
     # ---- 右：角速度-時間 ----
-    ax_w.plot(df["t_s"], df["angular_vel_dps"], lw=2)
+    ax_w.plot(df["t_s"], df["angular_vel_dps"], lw=2, color='red')
     ax_w.set_xlabel("Time (s)")
     ax_w.set_ylabel("Angular Velocity (deg/s)")
     ax_w.set_title("Angular Velocity vs Time")
     ax_w.grid(True, linestyle="--", alpha=0.4)
 
-    fig.savefig(f"{OUT_PREFIX}_pos_angvel_subplot.png", dpi=220)
+    # 保存圖片到資料夾
+    plot_path = os.path.join(output_dir, f"{OUT_PREFIX}_pos_angvel_subplot.png")
+    fig.savefig(plot_path, dpi=220)
     plt.close(fig)
-    print(f"[輸出] 圖片：{OUT_PREFIX}_pos_angvel_subplot.png")
+    print(f"[輸出] 分析圖片：{plot_path}")
+    
+    print(f"\n所有輸出檔案已整理至資料夾：{output_dir}")
 
 
 if __name__ == "__main__":
