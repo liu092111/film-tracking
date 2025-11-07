@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 
 # ========= 使用者設定（新增） =========
 USE_CAMERA      = True         # True=用攝影機；False=讀影片
-CAMERA_INDEX    = 0            # 你的 B0332 在系統中的 index（0/1/2…）
+CAMERA_INDEX    = 1            # 你的 B0332 在系統中的 index（0/1/2…）
 CAM_WIDTH       = 1280         # 想要的取樣解析度
 CAM_HEIGHT      = 720
 CAM_FPS_REQ     = 12           # 目標幀率（實際會依設備而定）
