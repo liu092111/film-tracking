@@ -29,7 +29,7 @@ import threading
 import time
 
 # ========= 使用者設定 =========
-CAMERA_INDEX    = 1            # 攝影機索引
+CAMERA_INDEX    = 0            # 攝影機索引
 CAM_WIDTH       = 1280         # 取樣解析度
 CAM_HEIGHT      = 720
 CAM_FPS_REQ     = 12           # 目標幀率
