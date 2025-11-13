@@ -41,6 +41,14 @@ try:
 except Exception:
     HAVE_SG = False
 
+# GIF 輸出相關
+try:
+    from PIL import Image
+    HAVE_PIL = True
+except ImportError:
+    HAVE_PIL = False
+    print("警告：未安裝 PIL/Pillow，GIF 輸出功能將被禁用")
+
 # ========== 攝影機設定 ==========
 MODE              = "straight"
 CAMERA_INDEX      = 1
@@ -64,7 +72,7 @@ HSV_WHITE_HI  = np.array([180, 60, 255], dtype=np.uint8)
 
 MIN_CONTOUR_AREA   = 50
 PROCESS_EVERY_N    = 1
-INVERT_Y_AXIS      = True
+INVERT_Y_AXIS      = False
 ORIENT_PLOT_WRAPPED= True
 ORIENT_YLIM_DEG    = 60
 PLOT_RANGE_SCALE   = 1.35
@@ -115,7 +123,7 @@ def finite_diff(values, t, smooth_win=1):
     return v
 
 class FunctionGeneratorController:
-    """函數產生器控制器 - 超高速電壓切換版本"""
+    """函數產生器控制器 - 高速電壓切換版本"""
     
     def __init__(self):
         self.inst = None
@@ -371,7 +379,7 @@ class FunctionGeneratorController:
             return False
     
     def switch_mode(self, mode_num):
-        """超快速模式切換 - 使用電壓調整方式"""
+        """快速模式切換 - 使用電壓調整方式"""
         if not self.connected or mode_num not in self.sampling_rates:
             return False
         
@@ -508,6 +516,15 @@ class CameraTracker:
         self.state = 0  # 0=PREVIEW, 1=RECORD
         self.output_dir = None  # 儲存輸出目錄路徑
         self.out_path = None    # 儲存影片檔案路徑
+        self.gif_frames = []    # 儲存 GIF 用的幀
+        self.gif_path = None    # 儲存 GIF 檔案路徑
+        
+        # 改善 FPS 計算 - 增加緩衝區大小以收集更多數據
+        self.fps_estimation_buffer = deque(maxlen=300)  # FPS 估算緩衝區
+        self.last_frame_time = None
+        self.actual_fps_buffer = deque(maxlen=600)  # 實際FPS計算緩衝區（增加容量）
+        self.frame_timestamps = deque(maxlen=600)   # 幀時間戳緩衝區（增加容量）
+        self.all_fps_data = []  # 儲存所有FPS數據用於CSV輸出
         
     def initialize_camera(self):
         """初始化攝影機"""
@@ -517,7 +534,7 @@ class CameraTracker:
         self.cap.set(cv2.CAP_PROP_FPS, CAM_FPS_REQ)
         
         # 暖機
-        print("⏳ 攝影機暖機中...")
+        print("攝影機暖機中...")
         for _ in range(INITIAL_DETECTION_WARMUP):
             self.cap.read()
         
@@ -534,7 +551,7 @@ class CameraTracker:
             self.mm_per_px = 0.1
         
         # 增強初始檢測 - 多次嘗試尋找目標
-        print("🔍 正在尋找追蹤目標...")
+        print("正在尋找追蹤目標...")
         initial_detection = None
         for attempt in range(INITIAL_DETECTION_RETRIES):
             ok, frame = self.cap.read()
@@ -551,7 +568,7 @@ class CameraTracker:
                 break
             
             if (attempt + 1) % 10 == 0:
-                print(f"⏳ 持續尋找目標... ({attempt + 1}/{INITIAL_DETECTION_RETRIES})")
+                print(f"持續尋找目標... ({attempt + 1}/{INITIAL_DETECTION_RETRIES})")
         
         # 初始化 Kalman 濾波器
         self.kf = self.make_kalman()
@@ -560,7 +577,7 @@ class CameraTracker:
             print(f"✓ 初始位置: ({cx0:.1f}, {cy0:.1f}), 角度: {ang0:.1f}°")
         else:
             cx0, cy0, ang0 = CAM_WIDTH/2.0, CAM_HEIGHT/2.0, 0.0
-            print("⚠️  未檢測到目標，使用預設位置。請確保目標在視野中且光線充足。")
+            print("未檢測到目標，使用預設位置。請確保目標在視野中且光線充足。")
         
         self.kf.statePost = np.array([[cx0],[cy0],[0.0],[0.0]], dtype=np.float32)
         
@@ -580,12 +597,13 @@ class CameraTracker:
         cv2.destroyAllWindows()
     
     def estimate_mm_per_px_single_frame(self, frame):
-        """估算 mm/px 比例"""
+        """估算 mm/px 比例 - 改善網格檢測"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (5,5), 0)
-        edges = cv2.Canny(gray, 60, 180)
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100, minLineLength=60, maxLineGap=10)
-        if lines is None or len(lines) < 8:
+        gray = cv2.GaussianBlur(gray, (3,3), 0)  # 減少模糊以保留更多細節
+        edges = cv2.Canny(gray, 50, 150)  # 調整Canny參數
+        # 增加線檢測的敏感度
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80, minLineLength=40, maxLineGap=15)
+        if lines is None or len(lines) < 6:
             return None
 
         horiz, vert = [], []
@@ -595,31 +613,63 @@ class CameraTracker:
             ang = np.degrees(np.arctan2(dy, dx))
             if ang < -90: ang += 180
             if ang >  90: ang -= 180
-            if abs(ang) < 10:
+            if abs(ang) < 8:  # 更嚴格的水平線判定
                 horiz.extend([y1, y2])
-            elif abs(abs(ang) - 90) < 10:
+            elif abs(abs(ang) - 90) < 8:  # 更嚴格的垂直線判定
                 vert.extend([x1, x2])
 
         def spacing(pos):
-            if len(pos) < 6: return None
+            if len(pos) < 4: return None
             pos = np.array(sorted(pos))
+            # 更精細的去重處理
             uniq = [pos[0]]
             for v in pos[1:]:
-                if abs(v - uniq[-1]) > 2:
+                if abs(v - uniq[-1]) > 1.5:  # 降低去重閾值
                     uniq.append(v)
             uniq = np.array(uniq)
-            if len(uniq) < 5: return None
+            if len(uniq) < 3: return None
+            
             diffs = np.diff(uniq)
-            diffs = diffs[(diffs > 5) & (diffs < 200)]
+            # 過濾掉異常值
+            diffs = diffs[(diffs > 2) & (diffs < 300)]
             if len(diffs) == 0: return None
-            return float(np.median(diffs))
+            
+            # 尋找最小的合理間距（應該對應5mm網格）
+            min_spacing = float(np.min(diffs))
+            median_spacing = float(np.median(diffs))
+            
+            # 如果最小間距和中位數間距相差很大，可能檢測到了10mm間距
+            if median_spacing > min_spacing * 1.8:
+                return min_spacing
+            else:
+                return median_spacing
 
         sp_h = spacing(horiz); sp_v = spacing(vert)
-        if sp_h and sp_v: px_per_cell = (sp_h + sp_v)/2.0
-        elif sp_h:        px_per_cell = sp_h
-        elif sp_v:        px_per_cell = sp_v
-        else:             return None
-        return (GRID_SPACING_MM / px_per_cell) if (px_per_cell and px_per_cell > 0) else None
+        
+        if sp_h and sp_v: 
+            px_per_cell = (sp_h + sp_v)/2.0
+        elif sp_h:        
+            px_per_cell = sp_h
+        elif sp_v:        
+            px_per_cell = sp_v
+        else:             
+            return None
+            
+        # 修正10倍放大問題：確保使用正確的網格間距計算
+        mm_per_px = GRID_SPACING_MM / px_per_cell if (px_per_cell and px_per_cell > 0) else None
+        
+        # 診斷輸出
+        if mm_per_px:
+            print(f"網格檢測結果：")
+            if sp_h: print(f"  水平間距: {sp_h:.1f} pixels")
+            if sp_v: print(f"  垂直間距: {sp_v:.1f} pixels")
+            print(f"  平均間距: {px_per_cell:.1f} pixels")
+            print(f"  計算比例: {mm_per_px:.4f} mm/pixel")
+            # 驗證：5mm網格應該對應多少像素
+            expected_pixels = GRID_SPACING_MM / mm_per_px
+            print(f"  驗證：5mm網格 = {expected_pixels:.1f} pixels")
+        
+        return mm_per_px
 
     def make_kalman(self):
         """創建 Kalman 濾波器"""
@@ -636,7 +686,7 @@ class CameraTracker:
         return kf
 
     def find_target_and_angle(self, frame_bgr):
-        """尋找目標並計算角度"""
+        """尋找目標並計算角度 - 修正 90 度偏移問題"""
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         mask_y = cv2.inRange(hsv, HSV_YELLOW_LO, HSV_YELLOW_HI)
         mask_w = cv2.inRange(hsv, HSV_WHITE_LO , HSV_WHITE_HI)
@@ -651,10 +701,16 @@ class CameraTracker:
 
         rect = cv2.minAreaRect(cnt)
         (cx, cy), (rw, rh), rect_angle = rect
-        if rw >= rh: angle_deg = rect_angle + 90.0
-        else:        angle_deg = rect_angle
+        
+        # 修正 90 度偏移問題：不需要額外加 90 度
+        if rw >= rh: 
+            angle_deg = rect_angle  # 移除 + 90.0
+        else:        
+            angle_deg = rect_angle - 90.0  # 調整為減 90 度
+        
+        # 正規化角度到 [-90, 90) 範圍
         while angle_deg >= 90.0: angle_deg -= 180.0
-        while angle_deg <  -90.0: angle_deg += 180.0
+        while angle_deg < -90.0: angle_deg += 180.0
 
         box = cv2.boxPoints(rect).astype(int)
         return (cx, cy, angle_deg, box)
@@ -799,21 +855,48 @@ class CameraTracker:
             cv2.putText(display_frame, "INTEGRATED PREVIEW - [SPACE] Start Recording, [1-4] FG Mode, [0] FG Off",
                         (20, CAM_WIDTH-30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
 
-        # 錄影處理（使用包含文字疊圖的畫面）
+        # 改善的FPS計算與錄影處理
         if self.state == 1 and RECORD_OUTPUT:  # RECORD
             ts_now = time.perf_counter()
             self.ts_list.append(ts_now)
+            self.frame_timestamps.append(ts_now)
+            
+            # 計算實際FPS
+            if len(self.frame_timestamps) >= 2:
+                recent_dt = self.frame_timestamps[-1] - self.frame_timestamps[-2]
+                if recent_dt > 0:
+                    current_fps = 1.0 / recent_dt
+                    self.actual_fps_buffer.append(current_fps)
+            
             if self.writer is None:
                 self.frame_buf.append(display_frame.copy())  # 使用包含文字的畫面
+                # 收集GIF幀（1:1還原，不降采樣）
+                if HAVE_PIL:
+                    gif_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                    # 縮小GIF尺寸以減少檔案大小
+                    gif_height, gif_width = gif_frame.shape[:2]
+                    new_width = min(gif_width, 480)
+                    new_height = int(gif_height * new_width / gif_width)
+                    gif_frame_resized = cv2.resize(gif_frame, (new_width, new_height))
+                    self.gif_frames.append(Image.fromarray(gif_frame_resized))
+                
                 if len(self.frame_buf) >= WARMUP_FRAMES_FOR_FPS and len(self.ts_list) >= WARMUP_FRAMES_FOR_FPS:
-                    dt = np.diff(np.array(self.ts_list[-WARMUP_FRAMES_FOR_FPS:], dtype=float))
-                    dt = dt[dt > 0]
-                    fps_out = float(1.0 / np.median(dt)) if dt.size > 0 else (fps_device or 30.0)
+                    # 使用實際測量的FPS而不是設備FPS
+                    if len(self.actual_fps_buffer) > 0:
+                        fps_out = float(np.median(list(self.actual_fps_buffer)))
+                    else:
+                        dt = np.diff(np.array(self.ts_list[-WARMUP_FRAMES_FOR_FPS:], dtype=float))
+                        dt = dt[dt > 0]
+                        fps_out = float(1.0 / np.median(dt)) if dt.size > 0 else 30.0
+                    
+                    # 限制FPS範圍，避免異常值
+                    fps_out = max(10.0, min(fps_out, 200.0))
                     
                     run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
                     self.output_dir = f"{run_tag}_{MODE}_integrated"
                     os.makedirs(self.output_dir, exist_ok=True)
                     self.out_path = os.path.join(self.output_dir, f"camera_{MODE}_tracked.mp4")
+                    self.gif_path = os.path.join(self.output_dir, f"camera_{MODE}_tracked.gif")
                     
                     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                     # 注意：由於畫面旋轉了90度，寬高要對調
@@ -821,11 +904,22 @@ class CameraTracker:
                     H = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))   # 旋轉後原寬度變高度
                     self.writer = cv2.VideoWriter(self.out_path, fourcc, fps_out, (W, H))
                     
+                    print(f"錄影參數：FPS={fps_out:.1f}, 解析度={W}x{H}")
+                    
                     for f in self.frame_buf:
                         self.writer.write(f)
                     self.frame_buf.clear()
             else:
                 self.writer.write(display_frame)  # 寫入包含文字的畫面
+                
+                # 繼續收集GIF幀（1:1還原）
+                if HAVE_PIL:
+                    gif_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                    gif_height, gif_width = gif_frame.shape[:2]
+                    new_width = min(gif_width, 480)
+                    new_height = int(gif_height * new_width / gif_width)
+                    gif_frame_resized = cv2.resize(gif_frame, (new_width, new_height))
+                    self.gif_frames.append(Image.fromarray(gif_frame_resized))
 
         # 記錄資料
         if self.state == 1:  # RECORD
@@ -996,17 +1090,18 @@ def process_and_export_data(camera_tracker):
         "frame","t_s","x_px_filt","y_px_filt","x_mm_abs","y_mm_abs","angle_deg_raw","mm_per_px"
     ])
     
-    # 計算相對起點座標
+    # 計算相對起點座標 - 修正Y座標正負號
     x_abs = df["x_mm_abs"].to_numpy()
     y_abs = df["y_mm_abs"].to_numpy()
     valid = np.isfinite(x_abs) & np.isfinite(y_abs)
     if valid.any():
         x0, y0 = x_abs[valid][0], y_abs[valid][0]
         df["x_mm"] = x_abs - x0
-        df["y_mm"] = y_abs - y0
+        # 修正Y座標正負號 - 加負號
+        df["y_mm"] = -(y_abs - y0)
     else:
         df["x_mm"] = x_abs
-        df["y_mm"] = y_abs
+        df["y_mm"] = -y_abs  # 也對絕對座標加負號
     
     # 可選：Savitzky–Golay 平滑座標
     USE_SG_POS = False  # 可以根據需要調整
@@ -1053,6 +1148,34 @@ def process_and_export_data(camera_tracker):
     plot_paths = generate_plots(df, output_dir, OUT_PREFIX)
     
     # 輸出訊息（與 real_time_camera.py 格式一致）
+    # 生成GIF檔案 - 修正1:1播放速度問題
+    if HAVE_PIL and len(camera_tracker.gif_frames) > 0 and camera_tracker.gif_path:
+        print("正在生成GIF檔案...")
+        try:
+            total_gif_frames = len(camera_tracker.gif_frames)
+            
+            if len(camera_tracker.rec) > 0 and total_gif_frames > 0:
+                # 計算真實的每幀時間間隔（毫秒）
+                total_time_s = camera_tracker.rec[-1][1] - camera_tracker.rec[0][1]
+                duration_per_frame = int((total_time_s * 1000) / total_gif_frames)
+                # 限制範圍：最小8ms(125fps)，最大500ms(2fps)
+                duration_per_frame = max(8, min(duration_per_frame, 500))
+            else:
+                # 預設60fps
+                duration_per_frame = 17  # 約60fps
+            
+            camera_tracker.gif_frames[0].save(
+                camera_tracker.gif_path,
+                save_all=True,
+                append_images=camera_tracker.gif_frames[1:],
+                duration=duration_per_frame,
+                loop=0,
+                optimize=True
+            )
+            print(f"✓ GIF已生成：{camera_tracker.gif_path} (幀間隔: {duration_per_frame}ms, 與原影片1:1播放)")
+        except Exception as e:
+            print(f"✗ GIF生成失敗：{e}")
+    
     print(f"[輸出] 目錄：{output_dir}")
     print(f"[輸出] CSV：{csv_path}")
     print(f"[輸出] Position 圖：{plot_paths['position']}")
@@ -1062,15 +1185,19 @@ def process_and_export_data(camera_tracker):
         print(f"[輸出] Angular Speed 圖：{plot_paths['angular_speed']}")
     if RECORD_OUTPUT and camera_tracker.out_path and os.path.exists(camera_tracker.out_path):
         print(f"[輸出] 追蹤影片：{camera_tracker.out_path}")
+    if HAVE_PIL and camera_tracker.gif_path and os.path.exists(camera_tracker.gif_path):
+        print(f"[輸出] 追蹤GIF：{camera_tracker.gif_path}")
     
-    print(f"\n✓ 已成功輸出四個檔案：")
+    print(f"\n✓ 已成功輸出檔案：")
     print(f"  1. 追蹤影片：{os.path.basename(camera_tracker.out_path) if camera_tracker.out_path else 'N/A'}")
-    print(f"  2. 位置圖表：{os.path.basename(plot_paths['position'])}")
+    if HAVE_PIL and camera_tracker.gif_path:
+        print(f"  2. 追蹤GIF：{os.path.basename(camera_tracker.gif_path)}")
+    print(f"  3. 位置圖表：{os.path.basename(plot_paths['position'])}")
     if MODE.lower() == "straight":
-        print(f"  3. 速度/角度圖表：{os.path.basename(plot_paths['speed_orientation'])}")
+        print(f"  4. 速度/角度圖表：{os.path.basename(plot_paths['speed_orientation'])}")
     else:
-        print(f"  3. 角速度圖表：{os.path.basename(plot_paths['angular_speed'])}")
-    print(f"  4. CSV 資料檔：{os.path.basename(csv_path)}")
+        print(f"  4. 角速度圖表：{os.path.basename(plot_paths['angular_speed'])}")
+    print(f"  5. CSV 資料檔：{os.path.basename(csv_path)}")
     
 def generate_plots(df, output_dir, OUT_PREFIX):
     """生成追蹤結果圖表"""
