@@ -12,6 +12,12 @@
 - 函數產生器：[1-4] 切換模式，[0] 關閉輸出
 - [H] 顯示幫助，[M] 切換操作模式
 
+修正重點：
+- 實際FPS測量（修正假設120FPS問題）
+- 使用實際時間戳記計算速度
+- 準確的網格參考（5mm×5mm）
+- 設備尺寸驗證（9mm×6mm）
+
 作者：整合版本
 """
 
@@ -59,8 +65,10 @@ RECORD_OUTPUT     = True
 WINDOW_TITLE      = "Integrated Camera & Function Generator Control"
 DISPLAY_SCALE     = 0.5  # 顯示縮放比例 - 縮小顯示畫面
 
-# 尺度設定
-GRID_SPACING_MM   = 5.0
+# 尺度設定 - 修正網格參考
+GRID_SPACING_MM   = 5.0  # 5mm × 5mm 網格
+DEVICE_WIDTH_MM   = 9.0  # 設備寬度 9mm
+DEVICE_HEIGHT_MM  = 6.0  # 設備高度 6mm
 AUTO_GRID_MM_PER_PX = True
 MANUAL_MM_PER_PX     = None
 
@@ -113,11 +121,13 @@ def moving_average(a, w):
     return np.convolve(a, kernel, mode='same')
 
 def finite_diff(values, t, smooth_win=1):
-    """有限差分計算導數"""
+    """有限差分計算導數 - 使用實際時間戳記"""
     v = np.full_like(values, np.nan, dtype=float)
     for i in range(1, len(values)):
         if np.isfinite(values[i]) and np.isfinite(values[i-1]) and (t[i] > t[i-1]):
-            v[i] = (values[i] - values[i-1]) / (t[i] - t[i-1])
+            dt = t[i] - t[i-1]
+            if dt > 0:  # 確保時間差為正
+                v[i] = (values[i] - values[i-1]) / dt
     if smooth_win and smooth_win > 1:
         v = moving_average(v, smooth_win)
     return v
@@ -492,7 +502,7 @@ class FunctionGeneratorController:
             print(f"關閉函數產生器失敗: {e}")
 
 class CameraTracker:
-    """攝影機追蹤器"""
+    """攝影機追蹤器 - 修正FPS和位置計算"""
     
     def __init__(self, fg_controller):
         self.fg_controller = fg_controller
@@ -514,17 +524,29 @@ class CameraTracker:
         self.inst_speed = np.nan
         self.mm_per_px = 0.1
         self.state = 0  # 0=PREVIEW, 1=RECORD
-        self.output_dir = None  # 儲存輸出目錄路徑
-        self.out_path = None    # 儲存影片檔案路徑
-        self.gif_frames = []    # 儲存 GIF 用的幀
-        self.gif_path = None    # 儲存 GIF 檔案路徑
+        self.output_dir = None
+        self.out_path = None
+        self.gif_frames = []
+        self.gif_path = None
         
-        # 改善 FPS 計算 - 增加緩衝區大小以收集更多數據
-        self.fps_estimation_buffer = deque(maxlen=300)  # FPS 估算緩衝區
+        # 修正的時間戳記計算 - 使用實際測量FPS而非假設值
+        self.start_time = None
+        self.current_timestamp = None
+        self.fps_measurement_started = False
+        self.measured_fps = None
+        self.fps_samples = deque(maxlen=200)  # 增加樣本數以獲得更穩定的FPS測量
+        self.fps_measurement_window = 3.0     # 3秒測量窗口
         self.last_frame_time = None
-        self.actual_fps_buffer = deque(maxlen=600)  # 實際FPS計算緩衝區（增加容量）
-        self.frame_timestamps = deque(maxlen=600)   # 幀時間戳緩衝區（增加容量）
-        self.all_fps_data = []  # 儲存所有FPS數據用於CSV輸出
+        self.frame_times = deque(maxlen=1000) # 儲存實際幀時間用於分析
+        
+        # FPS統計
+        self.fps_stats = {
+            'min': np.inf,
+            'max': 0,
+            'mean': 0,
+            'std': 0,
+            'count': 0
+        }
         
     def initialize_camera(self):
         """初始化攝影機"""
@@ -542,12 +564,21 @@ class CameraTracker:
         if not ok:
             raise RuntimeError("攝影機開啟失敗")
         
-        # 估算 mm/px
+        # 估算 mm/px - 改進網格檢測準確性，考慮設備尺寸
         if AUTO_GRID_MM_PER_PX:
             self.mm_per_px = self.estimate_mm_per_px_single_frame(first)
+            if self.mm_per_px is not None:
+                # 驗證網格檢測結果是否合理
+                device_width_px = DEVICE_WIDTH_MM / self.mm_per_px
+                device_height_px = DEVICE_HEIGHT_MM / self.mm_per_px
+                print(f"網格比例：{self.mm_per_px:.4f} mm/px")
+                print(f"設備尺寸估算：{device_width_px:.1f} × {device_height_px:.1f} pixels ({DEVICE_WIDTH_MM}mm × {DEVICE_HEIGHT_MM}mm)")
+                print(f"網格間距：{GRID_SPACING_MM / self.mm_per_px:.1f} pixels ({GRID_SPACING_MM}mm)")
         else:
             self.mm_per_px = MANUAL_MM_PER_PX
+            
         if self.mm_per_px is None:
+            print("無法自動檢測網格，使用預設比例")
             self.mm_per_px = 0.1
         
         # 增強初始檢測 - 多次嘗試尋找目標
@@ -579,743 +610,699 @@ class CameraTracker:
             cx0, cy0, ang0 = CAM_WIDTH/2.0, CAM_HEIGHT/2.0, 0.0
             print("未檢測到目標，使用預設位置。請確保目標在視野中且光線充足。")
         
-        self.kf.statePost = np.array([[cx0],[cy0],[0.0],[0.0]], dtype=np.float32)
+        self.kf.x[:2] = np.array([[cx0], [cy0]], dtype=np.float32)
+        self.ema_x = cx0
+        self.ema_y = cy0
+        self.ema_ang = ang0
         
-        # 初始化位置歷史（用於靜止檢測）
-        self.position_history = deque(maxlen=STATIC_SMOOTHING_FRAMES)
-        self.is_static = False
-        
-        print("✓ 攝影機已初始化")
+        print(f"✓ 攝影機初始化完成 (解析度: {CAM_WIDTH}×{CAM_HEIGHT}, 比例: {self.mm_per_px:.4f} mm/px)")
         return True
     
-    def cleanup_camera(self):
-        """清理攝影機資源"""
+    def measure_actual_fps(self):
+        """測量實際FPS - 修正版本"""
+        current_time = time.time()
+        
+        if not self.fps_measurement_started:
+            self.fps_measurement_started = True
+            self.last_frame_time = current_time
+            return None
+            
+        if self.last_frame_time is not None:
+            dt = current_time - self.last_frame_time
+            if dt > 0:
+                instantaneous_fps = 1.0 / dt
+                self.fps_samples.append(instantaneous_fps)
+                self.frame_times.append(current_time)
+                
+                # 更新統計
+                self.fps_stats['count'] += 1
+                self.fps_stats['min'] = min(self.fps_stats['min'], instantaneous_fps)
+                self.fps_stats['max'] = max(self.fps_stats['max'], instantaneous_fps)
+                
+                # 計算移動平均FPS
+                if len(self.fps_samples) >= 10:
+                    recent_fps = list(self.fps_samples)[-50:]  # 最近50幀
+                    self.measured_fps = np.mean(recent_fps)
+                    self.fps_stats['mean'] = np.mean(list(self.fps_samples))
+                    self.fps_stats['std'] = np.std(list(self.fps_samples))
+                
+        self.last_frame_time = current_time
+        return self.measured_fps
+    
+    def get_accurate_timestamp(self):
+        """獲取準確的時間戳記"""
+        current_time = time.time()
+        
+        if self.start_time is None:
+            self.start_time = current_time
+            self.current_timestamp = 0.0
+        else:
+            self.current_timestamp = current_time - self.start_time
+            
+        return self.current_timestamp
+    
+    def estimate_mm_per_px_single_frame(self, frame):
+        """估算單幀的mm/px比例 - 基於5mm×5mm網格"""
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # 檢測水平線
+            horizontal_lines = cv2.HoughLinesP(
+                cv2.Canny(gray, 50, 150), 
+                1, np.pi/180, threshold=100, 
+                minLineLength=50, maxLineGap=10
+            )
+            
+            # 檢測垂直線
+            vertical_lines = cv2.HoughLinesP(
+                cv2.Canny(gray, 50, 150), 
+                1, np.pi/2, threshold=100, 
+                minLineLength=50, maxLineGap=10
+            )
+            
+            if horizontal_lines is not None and vertical_lines is not None:
+                # 計算水平間距
+                h_spacings = []
+                for i in range(len(horizontal_lines) - 1):
+                    y1 = (horizontal_lines[i][0][1] + horizontal_lines[i][0][3]) / 2
+                    y2 = (horizontal_lines[i+1][0][1] + horizontal_lines[i+1][0][3]) / 2
+                    spacing = abs(y2 - y1)
+                    if 20 < spacing < 200:  # 合理範圍
+                        h_spacings.append(spacing)
+                
+                # 計算垂直間距
+                v_spacings = []
+                for i in range(len(vertical_lines) - 1):
+                    x1 = (vertical_lines[i][0][0] + vertical_lines[i][0][2]) / 2
+                    x2 = (vertical_lines[i+1][0][0] + vertical_lines[i+1][0][2]) / 2
+                    spacing = abs(x2 - x1)
+                    if 20 < spacing < 200:  # 合理範圍
+                        v_spacings.append(spacing)
+                
+                if h_spacings and v_spacings:
+                    avg_h_spacing = np.median(h_spacings)
+                    avg_v_spacing = np.median(v_spacings)
+                    avg_spacing_px = (avg_h_spacing + avg_v_spacing) / 2
+                    
+                    mm_per_px = GRID_SPACING_MM / avg_spacing_px
+                    print(f"檢測到網格間距：{avg_spacing_px:.1f} pixels → {mm_per_px:.4f} mm/px")
+                    return mm_per_px
+            
+        except Exception as e:
+            print(f"網格檢測失敗：{e}")
+        
+        return None
+    
+    def find_target_and_angle(self, frame):
+        """尋找目標和角度 - 考慮9mm×6mm設備尺寸"""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # 黃色遮罩
+        mask_yellow = cv2.inRange(hsv, HSV_YELLOW_LO, HSV_YELLOW_HI)
+        
+        # 形態學操作
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN, kernel)
+        mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_CLOSE, kernel)
+        
+        # 尋找輪廓
+        contours, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return None
+        
+        # 根據設備尺寸篩選輪廓
+        expected_area_px = (DEVICE_WIDTH_MM * DEVICE_HEIGHT_MM) / (self.mm_per_px ** 2)
+        
+        valid_contours = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > MIN_CONTOUR_AREA:
+                # 檢查面積是否符合設備尺寸
+                area_ratio = area / expected_area_px
+                if 0.3 <= area_ratio <= 3.0:  # 合理範圍
+                    valid_contours.append(contour)
+        
+        if not valid_contours:
+            # 如果沒有符合尺寸的，使用最大的
+            largest_contour = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest_contour) > MIN_CONTOUR_AREA:
+                valid_contours = [largest_contour]
+        
+        if not valid_contours:
+            return None
+        
+        # 選擇最大的有效輪廓
+        contour = max(valid_contours, key=cv2.contourArea)
+        
+        # 計算中心和角度
+        try:
+            # 使用最小外接矩形
+            rect = cv2.minAreaRect(contour)
+            cx, cy = rect[0]
+            angle = rect[2]
+            
+            # 角度標準化
+            if rect[1][0] < rect[1][1]:  # width < height
+                angle += 90
+            
+            angle = angle % 180
+            if angle > 90:
+                angle -= 180
+            
+            # 獲取矩形頂點
+            box = cv2.boxPoints(rect)
+            box = np.int0(box)
+            
+            return cx, cy, angle, box
+            
+        except Exception as e:
+            print(f"角度計算失敗：{e}")
+            return None
+    
+    def make_kalman(self):
+        """建立Kalman濾波器"""
+        kf = cv2.KalmanFilter(4, 2)  # 4 states, 2 measurements
+        
+        # 狀態轉移矩陣 (x, y, vx, vy)
+        kf.transitionMatrix = np.array([
+            [1, 0, 1, 0],
+            [0, 1, 0, 1],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+        
+        # 測量矩陣
+        kf.measurementMatrix = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ], dtype=np.float32)
+        
+        # 過程噪聲協方差
+        kf.processNoiseCov = np.eye(4, dtype=np.float32) * KF_PROCESS_NOISE
+        
+        # 測量噪聲協方差
+        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * KF_MEASURE_NOISE
+        
+        # 錯誤協方差
+        kf.errorCovPost = np.eye(4, dtype=np.float32)
+        
+        return kf
+    
+    def start_recording(self):
+        """開始錄製"""
+        if self.state != 0:
+            return
+            
+        # 建立輸出目錄
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.output_dir = f"{timestamp}_{MODE}_integrated"
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        # 設定影片輸出
+        if RECORD_OUTPUT:
+            self.out_path = os.path.join(self.output_dir, f"camera_{MODE}_tracked.mp4")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            # 使用測量的FPS或預設值
+            fps_for_video = self.measured_fps if self.measured_fps else CAM_FPS_REQ
+            self.writer = cv2.VideoWriter(self.out_path, fourcc, fps_for_video, (CAM_HEIGHT, CAM_WIDTH))
+            
+            # GIF路徑
+            if HAVE_PIL:
+                self.gif_path = os.path.join(self.output_dir, f"camera_{MODE}_tracked.gif")
+        
+        # 重置記錄
+        self.rec = []
+        self.frame_buf = []
+        self.ts_list = []
+        self.frame_idx = 0
+        self.gif_frames = []
+        
+        # 重置時間戳記
+        self.start_time = None
+        self.fps_measurement_started = False
+        self.fps_samples.clear()
+        self.frame_times.clear()
+        
+        self.state = 1
+        print(f"✓ 開始錄製到：{self.output_dir}")
+    
+    def stop_recording(self):
+        """停止錄製並生成分析圖表"""
+        if self.state != 1:
+            return
+            
+        self.state = 0
+        print("停止錄製，正在生成分析...")
+        
+        # 關閉影片寫入器
+        if self.writer:
+            self.writer.release()
+            self.writer = None
+        
+        # 生成分析
+        if len(self.rec) > 10:
+            try:
+                self.generate_analysis()
+                print(f"✓ 分析完成，檔案儲存在：{self.output_dir}")
+            except Exception as e:
+                print(f"分析生成失敗：{e}")
+        else:
+            print("記錄數據不足，跳過分析生成")
+    
+    def process_frame(self, frame):
+        """處理單幀 - 修正時間戳記計算"""
+        # 測量實際FPS
+        measured_fps = self.measure_actual_fps()
+        
+        # 獲取準確時間戳記
+        timestamp = self.get_accurate_timestamp()
+        
+        # 旋轉畫面
+        frame_rotated = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        h, w = frame_rotated.shape[:2]
+        
+        # 尋找目標
+        detection = self.find_target_and_angle(frame_rotated)
+        
+        # 預測和更新
+        self.kf.predict()
+        
+        if detection is not None:
+            cx_meas, cy_meas, ang_meas, box = detection
+            
+            # 檢查測量跳躍
+            if (self.ema_x is not None and self.ema_y is not None and
+                np.sqrt((cx_meas - self.ema_x)**2 + (cy_meas - self.ema_y)**2) > MAX_MEAS_JUMP_PX):
+                # 跳躍太大，使用預測值
+                cx_filt = self.kf.statePre[0, 0]
+                cy_filt = self.kf.statePre[1, 0]
+                ang_filt = self.ema_ang
+            else:
+                # 正常更新
+                measurement = np.array([[cx_meas], [cy_meas]], dtype=np.float32)
+                self.kf.correct(measurement)
+                
+                cx_filt = self.kf.statePost[0, 0]
+                cy_filt = self.kf.statePost[1, 0]
+                
+                # EMA平滑角度
+                if self.ema_ang is None:
+                    ang_filt = ang_meas
+                else:
+                    ang_diff = ang_meas - self.ema_ang
+                    if abs(ang_diff) > 90:
+                        ang_diff = ang_diff - 180 * np.sign(ang_diff)
+                    ang_filt = self.ema_ang + EMA_ALPHA_ANGLE * ang_diff
+                
+                # 更新EMA
+                if self.ema_x is None:
+                    self.ema_x, self.ema_y = cx_filt, cy_filt
+                else:
+                    self.ema_x += EMA_ALPHA_POS * (cx_filt - self.ema_x)
+                    self.ema_y += EMA_ALPHA_POS * (cy_filt - self.ema_y)
+                self.ema_ang = ang_filt
+        else:
+            # 沒有檢測到，使用預測值
+            cx_filt = self.kf.statePre[0, 0]
+            cy_filt = self.kf.statePre[1, 0]
+            ang_filt = self.ema_ang
+            box = None
+        
+        # 計算實際位置 (mm)
+        if self.origin_x is None or self.origin_y is None:
+            self.origin_x, self.origin_y = cx_filt, cy_filt
+        
+        x_mm_rel = (cx_filt - self.origin_x) * self.mm_per_px
+        y_mm_rel = (cy_filt - self.origin_y) * self.mm_per_px
+        
+        if INVERT_Y_AXIS:
+            y_mm_rel = -y_mm_rel
+        
+        x_mm_abs = cx_filt * self.mm_per_px
+        y_mm_abs = cy_filt * self.mm_per_px
+        
+        # 計算瞬時速度 (使用實際時間戳記)
+        if (self.last_x_mm_abs is not None and self.last_y_mm_abs is not None and 
+            self.last_t is not None and timestamp > self.last_t):
+            dt = timestamp - self.last_t
+            if dt > 0:
+                dx = x_mm_abs - self.last_x_mm_abs
+                dy = y_mm_abs - self.last_y_mm_abs
+                self.inst_speed = np.sqrt(dx*dx + dy*dy) / dt  # mm/s
+        
+        self.last_x_mm_abs = x_mm_abs
+        self.last_y_mm_abs = y_mm_abs
+        self.last_t = timestamp
+        
+        # 記錄數據
+        if self.state == 1:  # 錄製中
+            self.rec.append({
+                'frame': self.frame_idx,
+                'timestamp': timestamp,
+                'x_px': cx_filt,
+                'y_px': cy_filt,
+                'angle_deg': ang_filt,
+                'x_mm_rel': x_mm_rel,
+                'y_mm_rel': y_mm_rel,
+                'x_mm_abs': x_mm_abs,
+                'y_mm_abs': y_mm_abs,
+                'speed_mm_s': self.inst_speed,
+                'fps': measured_fps if measured_fps else np.nan
+            })
+            
+            # 儲存幀到緩衝區
+            self.frame_buf.append(frame_rotated.copy())
+            self.ts_list.append(timestamp)
+            
+            # 寫入影片
+            if self.writer:
+                self.writer.write(frame_rotated)
+            
+            # 儲存GIF幀
+            if HAVE_PIL and len(self.gif_frames) < 300:  # 限制GIF大小
+                if self.frame_idx % 3 == 0:  # 每3幀取1幀
+                    gif_frame = cv2.cvtColor(frame_rotated, cv2.COLOR_BGR2RGB)
+                    gif_frame = cv2.resize(gif_frame, (frame_rotated.shape[1]//2, frame_rotated.shape[0]//2))
+                    self.gif_frames.append(Image.fromarray(gif_frame))
+        
+        # 繪製結果
+        display_frame = frame_rotated.copy()
+        
+        # 繪製檢測框 - 使用紅色框表示設備尺寸
+        if box is not None:
+            cv2.drawContours(display_frame, [box], -1, (0, 0, 255), 2)  # 紅色框
+        
+        # 繪製中心點
+        center = (int(cx_filt), int(cy_filt))
+        cv2.circle(display_frame, center, 5, (0, 255, 0), -1)
+        
+        # 繪製方向線
+        if ang_filt is not None:
+            length = 30
+            end_x = int(cx_filt + length * np.cos(np.radians(ang_filt)))
+            end_y = int(cy_filt + length * np.sin(np.radians(ang_filt)))
+            cv2.arrowedLine(display_frame, center, (end_x, end_y), (255, 0, 0), 2)
+        
+        # 顯示資訊
+        info_lines = [
+            f"FPS: {measured_fps:.1f}" if measured_fps else f"FPS: {CAM_FPS_REQ}(設定)",
+            f"位置: ({x_mm_rel:.1f}, {y_mm_rel:.1f}) mm",
+            f"角度: {ang_filt:.1f}°" if ang_filt is not None else "角度: N/A",
+            f"速度: {self.inst_speed:.1f} mm/s" if np.isfinite(self.inst_speed) else "速度: N/A",
+            f"狀態: {'錄製中' if self.state == 1 else '預覽'}",
+        ]
+        
+        if self.fg_controller.current_mode:
+            info_lines.append(f"FG: Mode {self.fg_controller.current_mode}")
+        else:
+            info_lines.append("FG: 關閉")
+        
+        for i, line in enumerate(info_lines):
+            cv2.putText(display_frame, line, (10, 30 + i * 25), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        self.frame_idx += 1
+        
+        # 調整顯示大小
+        if DISPLAY_SCALE != 1.0:
+            new_w = int(display_frame.shape[1] * DISPLAY_SCALE)
+            new_h = int(display_frame.shape[0] * DISPLAY_SCALE)
+            display_frame = cv2.resize(display_frame, (new_w, new_h))
+        
+        return display_frame
+    
+    def generate_analysis(self):
+        """生成分析圖表 - 使用實際時間戳記"""
+        if len(self.rec) < 2:
+            return
+        
+        df = pd.DataFrame(self.rec)
+        
+        # 保存CSV (包含FPS數據)
+        csv_path = os.path.join(self.output_dir, f"camera_{MODE}_pos_angle_speed.csv")
+        df.to_csv(csv_path, index=False)
+        
+        # 準備數據
+        t = df['timestamp'].values  # 使用實際時間戳記
+        x_mm = df['x_mm_rel'].values
+        y_mm = df['y_mm_rel'].values
+        angles = df['angle_deg'].values
+        
+        # 計算導數使用實際時間
+        vx = finite_diff(x_mm, t, smooth_win=5)
+        vy = finite_diff(y_mm, t, smooth_win=5)
+        speed = np.sqrt(vx**2 + vy**2)
+        
+        # 角速度計算
+        angles_unwrapped = unwrap_angles_deg(angles)
+        angular_speed = finite_diff(angles_unwrapped, t, smooth_win=5)
+        
+        # 生成圖表
+        plot_paths = self.create_plots(t, x_mm, y_mm, angles, speed, angular_speed, df)
+        
+        # 生成GIF
+        if HAVE_PIL and self.gif_frames and self.gif_path:
+            try:
+                self.gif_frames[0].save(
+                    self.gif_path,
+                    save_all=True,
+                    append_images=self.gif_frames[1:],
+                    duration=100,  # 100ms per frame
+                    loop=0
+                )
+                print(f"✓ GIF 已儲存：{self.gif_path}")
+            except Exception as e:
+                print(f"GIF 生成失敗：{e}")
+        
+        return plot_paths
+    
+    def create_plots(self, t, x_mm, y_mm, angles, speed, angular_speed, df):
+        """建立分析圖表"""
+        plot_paths = {}
+        
+        # 圖1：位置軌跡
+        plt.figure(figsize=(10, 8))
+        plt.plot(x_mm, y_mm, 'b-', linewidth=2, alpha=0.7, label='軌跡')
+        plt.scatter(x_mm[0], y_mm[0], color='green', s=100, marker='o', label='起點', zorder=5)
+        plt.scatter(x_mm[-1], y_mm[-1], color='red', s=100, marker='s', label='終點', zorder=5)
+        
+        # 添加網格參考線
+        x_range = max(x_mm) - min(x_mm)
+        y_range = max(y_mm) - min(y_mm)
+        plot_range = max(x_range, y_range) * PLOT_RANGE_SCALE
+        
+        x_center = (max(x_mm) + min(x_mm)) / 2
+        y_center = (max(y_mm) + min(y_mm)) / 2
+        
+        # 5mm網格線
+        grid_spacing = GRID_SPACING_MM
+        x_grid = np.arange(x_center - plot_range/2, x_center + plot_range/2 + grid_spacing, grid_spacing)
+        y_grid = np.arange(y_center - plot_range/2, y_center + plot_range/2 + grid_spacing, grid_spacing)
+        
+        for x_line in x_grid:
+            plt.axvline(x=x_line, color='gray', linestyle='--', alpha=0.3, linewidth=0.5)
+        for y_line in y_grid:
+            plt.axhline(y=y_line, color='gray', linestyle='--', alpha=0.3, linewidth=0.5)
+        
+        plt.xlabel('X 位置 (mm)')
+        plt.ylabel('Y 位置 (mm)')
+        plt.title(f'設備位置軌跡 - {DEVICE_WIDTH_MM}mm×{DEVICE_HEIGHT_MM}mm 設備於 {GRID_SPACING_MM}mm×{GRID_SPACING_MM}mm 網格')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.axis('equal')
+        
+        pos_path = os.path.join(self.output_dir, f"camera_{MODE}_position.png")
+        plt.tight_layout()
+        plt.savefig(pos_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        plot_paths['position'] = pos_path
+        
+        # 圖2：速度和角度隨時間變化
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # 速度
+        ax1.plot(t, speed, 'r-', linewidth=1.5, label='線性速度')
+        ax1.set_xlabel('時間 (s)')
+        ax1.set_ylabel('速度 (mm/s)')
+        ax1.set_title('線性速度隨時間變化')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        
+        # 角度
+        if ORIENT_PLOT_WRAPPED:
+            angles_plot = wrap_angles_deg(angles)
+            ax2.set_ylim([-ORIENT_YLIM_DEG, ORIENT_YLIM_DEG])
+        else:
+            angles_plot = unwrap_angles_deg(angles)
+        
+        ax2.plot(t, angles_plot, 'g-', linewidth=1.5, label='角度')
+        ax2.set_xlabel('時間 (s)')
+        ax2.set_ylabel('角度 (度)')
+        ax2.set_title('角度隨時間變化')
+        ax2.grid(True, alpha=0.3)
+        ax2.legend()
+        
+        # 角速度
+        ax3.plot(t, angular_speed, 'm-', linewidth=1.5, label='角速度')
+        ax3.set_xlabel('時間 (s)')
+        ax3.set_ylabel('角速度 (度/s)')
+        ax3.set_title('角速度隨時間變化')
+        ax3.grid(True, alpha=0.3)
+        ax3.legend()
+        
+        # FPS統計
+        if 'fps' in df.columns:
+            fps_data = df['fps'].dropna()
+            if len(fps_data) > 0:
+                ax4.plot(t[:len(fps_data)], fps_data, 'c-', linewidth=1.5, label='實際FPS')
+                ax4.axhline(y=fps_data.mean(), color='orange', linestyle='--', 
+                           label=f'平均FPS: {fps_data.mean():.1f}')
+                ax4.set_xlabel('時間 (s)')
+                ax4.set_ylabel('FPS')
+                ax4.set_title('實際幀率隨時間變化')
+                ax4.grid(True, alpha=0.3)
+                ax4.legend()
+        
+        plt.tight_layout()
+        speed_path = os.path.join(self.output_dir, f"camera_{MODE}_speed_orientation.png")
+        plt.savefig(speed_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        plot_paths['speed_orientation'] = speed_path
+        
+        return plot_paths
+    
+    def cleanup(self):
+        """清理資源"""
         if self.cap:
             self.cap.release()
         if self.writer:
             self.writer.release()
         cv2.destroyAllWindows()
-    
-    def estimate_mm_per_px_single_frame(self, frame):
-        """估算 mm/px 比例 - 改善網格檢測"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (3,3), 0)  # 減少模糊以保留更多細節
-        edges = cv2.Canny(gray, 50, 150)  # 調整Canny參數
-        # 增加線檢測的敏感度
-        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80, minLineLength=40, maxLineGap=15)
-        if lines is None or len(lines) < 6:
-            return None
-
-        horiz, vert = [], []
-        for l in lines:
-            x1, y1, x2, y2 = l[0]
-            dx, dy = x2 - x1, y2 - y1
-            ang = np.degrees(np.arctan2(dy, dx))
-            if ang < -90: ang += 180
-            if ang >  90: ang -= 180
-            if abs(ang) < 8:  # 更嚴格的水平線判定
-                horiz.extend([y1, y2])
-            elif abs(abs(ang) - 90) < 8:  # 更嚴格的垂直線判定
-                vert.extend([x1, x2])
-
-        def spacing(pos):
-            if len(pos) < 4: return None
-            pos = np.array(sorted(pos))
-            # 更精細的去重處理
-            uniq = [pos[0]]
-            for v in pos[1:]:
-                if abs(v - uniq[-1]) > 1.5:  # 降低去重閾值
-                    uniq.append(v)
-            uniq = np.array(uniq)
-            if len(uniq) < 3: return None
-            
-            diffs = np.diff(uniq)
-            # 過濾掉異常值
-            diffs = diffs[(diffs > 2) & (diffs < 300)]
-            if len(diffs) == 0: return None
-            
-            # 尋找最小的合理間距（應該對應5mm網格）
-            min_spacing = float(np.min(diffs))
-            median_spacing = float(np.median(diffs))
-            
-            # 如果最小間距和中位數間距相差很大，可能檢測到了10mm間距
-            if median_spacing > min_spacing * 1.8:
-                return min_spacing
-            else:
-                return median_spacing
-
-        sp_h = spacing(horiz); sp_v = spacing(vert)
-        
-        if sp_h and sp_v: 
-            px_per_cell = (sp_h + sp_v)/2.0
-        elif sp_h:        
-            px_per_cell = sp_h
-        elif sp_v:        
-            px_per_cell = sp_v
-        else:             
-            return None
-            
-        # 修正10倍放大問題：確保使用正確的網格間距計算
-        mm_per_px = GRID_SPACING_MM / px_per_cell if (px_per_cell and px_per_cell > 0) else None
-        
-        # 診斷輸出
-        if mm_per_px:
-            print(f"網格檢測結果：")
-            if sp_h: print(f"  水平間距: {sp_h:.1f} pixels")
-            if sp_v: print(f"  垂直間距: {sp_v:.1f} pixels")
-            print(f"  平均間距: {px_per_cell:.1f} pixels")
-            print(f"  計算比例: {mm_per_px:.4f} mm/pixel")
-            # 驗證：5mm網格應該對應多少像素
-            expected_pixels = GRID_SPACING_MM / mm_per_px
-            print(f"  驗證：5mm網格 = {expected_pixels:.1f} pixels")
-        
-        return mm_per_px
-
-    def make_kalman(self):
-        """創建 Kalman 濾波器"""
-        kf = cv2.KalmanFilter(4, 2)
-        kf.transitionMatrix = np.array([[1,0,1,0],
-                                        [0,1,0,1],
-                                        [0,0,1,0],
-                                        [0,0,0,1]], dtype=np.float32)
-        kf.measurementMatrix = np.array([[1,0,0,0],
-                                         [0,1,0,0]], dtype=np.float32)
-        kf.processNoiseCov = np.eye(4, dtype=np.float32) * KF_PROCESS_NOISE
-        kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * KF_MEASURE_NOISE
-        kf.errorCovPost = np.eye(4, dtype=np.float32)
-        return kf
-
-    def find_target_and_angle(self, frame_bgr):
-        """尋找目標並計算角度 - 修正 90 度偏移問題"""
-        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        mask_y = cv2.inRange(hsv, HSV_YELLOW_LO, HSV_YELLOW_HI)
-        mask_w = cv2.inRange(hsv, HSV_WHITE_LO , HSV_WHITE_HI)
-        mask = cv2.bitwise_or(mask_y, mask_w)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3),np.uint8), iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5),np.uint8), iterations=1)
-
-        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not cnts: return None
-        cnt = max(cnts, key=cv2.contourArea)
-        if cv2.contourArea(cnt) < MIN_CONTOUR_AREA: return None
-
-        rect = cv2.minAreaRect(cnt)
-        (cx, cy), (rw, rh), rect_angle = rect
-        
-        # 修正 90 度偏移問題：不需要額外加 90 度
-        if rw >= rh: 
-            angle_deg = rect_angle  # 移除 + 90.0
-        else:        
-            angle_deg = rect_angle - 90.0  # 調整為減 90 度
-        
-        # 正規化角度到 [-90, 90) 範圍
-        while angle_deg >= 90.0: angle_deg -= 180.0
-        while angle_deg < -90.0: angle_deg += 180.0
-
-        box = cv2.boxPoints(rect).astype(int)
-        return (cx, cy, angle_deg, box)
-
-    def ema(self, prev, cur, alpha):
-        """指數移動平均"""
-        if prev is None or not np.isfinite(prev): return cur
-        if not np.isfinite(cur): return prev
-        return alpha*prev + (1.0-alpha)*cur
-
-    def process_frame(self, frame):
-        """處理單一幀"""
-        if self.frame_idx % PROCESS_EVERY_N != 0:
-            self.frame_idx += 1
-            return frame
-
-        # 順時針旋轉90度以修正鏡像問題（先旋轉畫面內容）
-        frame_rotated = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-
-        # Kalman 預測
-        pred = self.kf.predict()
-        px_pred, py_pred = float(pred[0,0]), float(pred[1,0])
-
-        # 目標檢測（在旋轉後的畫面上進行）
-        m = self.find_target_and_angle(frame_rotated)
-        use_meas = True
-        if m is not None:
-            cx, cy, angle_deg, box = m
-            # 離群保護
-            dist = np.hypot(cx - px_pred, cy - py_pred)
-            if dist > MAX_MEAS_JUMP_PX:
-                use_meas = False
-        else:
-            use_meas = False
-
-        if use_meas:
-            est = self.kf.correct(np.array([[cx],[cy]], dtype=np.float32))
-            fx_raw, fy_raw = float(est[0,0]), float(est[1,0])
-        else:
-            fx_raw, fy_raw = px_pred, py_pred
-            angle_deg = np.nan
-            box = None
-
-        # EMA 平滑
-        self.ema_x = self.ema(self.ema_x, fx_raw, EMA_ALPHA_POS)
-        self.ema_y = self.ema(self.ema_y, fy_raw, EMA_ALPHA_POS)
-        self.ema_ang = self.ema(self.ema_ang, angle_deg, EMA_ALPHA_ANGLE) if np.isfinite(angle_deg) else self.ema_ang
-
-        fx, fy = float(self.ema_x), float(self.ema_y)
-        ang_for_draw = float(self.ema_ang) if self.ema_ang is not None else (float(angle_deg) if m is not None else np.nan)
-
-        # 繪製結果（在旋轉後的畫面上）
-        if box is None:
-            sz = 20
-            bx = np.array([[fx-sz, fy-sz],[fx+sz, fy-sz],[fx+sz, fy+sz],[fx-sz, fy+sz]], dtype=int)
-            box_draw = bx
-            green_center_x, green_center_y = fx, fy
-        else:
-            box_draw = box
-            green_center_x, green_center_y = cx, cy
-
-        # 繪製追蹤結果
-        cv2.polylines(frame_rotated, [box_draw], isClosed=True, color=(0,0,255), thickness=3)
-        if np.isfinite(green_center_x) and np.isfinite(green_center_y):
-            cv2.circle(frame_rotated, (int(round(green_center_x)), int(round(green_center_y))), 6, (0,255,0), -1)
-
-        # 計算座標和速度
-        fx_mm_abs = fx * self.mm_per_px if np.isfinite(fx) else np.nan
-        fy_mm_abs = fy * self.mm_per_px if np.isfinite(fy) else np.nan
-
-        fps_device = self.cap.get(cv2.CAP_PROP_FPS) or float(CAM_FPS_REQ)
-        t_s = self.frame_idx / (fps_device if fps_device > 0 else 30.0)
-
-        # 靜止檢測和額外平滑
-        if np.isfinite(fx_mm_abs) and np.isfinite(fy_mm_abs):
-            current_pos = (fx_mm_abs, fy_mm_abs)
-            self.position_history.append(current_pos)
-            
-            # 檢測是否靜止
-            if len(self.position_history) >= STATIC_SMOOTHING_FRAMES:
-                positions = np.array(self.position_history)
-                max_movement = np.max(np.sqrt(np.sum((positions - positions[0])**2, axis=1)))
-                self.is_static = max_movement < STATIC_DETECTION_THRESHOLD
-                
-                # 如果靜止，使用位置歷史的平均值進行額外平滑
-                if self.is_static:
-                    avg_pos = np.mean(positions, axis=0)
-                    fx_mm_abs, fy_mm_abs = avg_pos[0], avg_pos[1]
-                    # 同時平滑像素座標
-                    fx = fx_mm_abs / self.mm_per_px
-                    fy = fy_mm_abs / self.mm_per_px
-
-        if (self.last_x_mm_abs is not None and self.last_y_mm_abs is not None and self.last_t is not None and
-            np.isfinite(fx_mm_abs) and np.isfinite(fy_mm_abs) and (t_s > self.last_t)):
-            raw_speed = np.hypot(fx_mm_abs-self.last_x_mm_abs, fy_mm_abs-self.last_y_mm_abs) / (t_s - self.last_t)
-            # 靜止時將速度設為接近零
-            if hasattr(self, 'is_static') and self.is_static:
-                self.inst_speed = 0.0
-            else:
-                self.inst_speed = raw_speed
-        self.last_x_mm_abs, self.last_y_mm_abs, self.last_t = fx_mm_abs, fy_mm_abs, t_s
-
-        if self.origin_x is None and np.isfinite(fx_mm_abs) and np.isfinite(fy_mm_abs):
-            self.origin_x, self.origin_y = fx_mm_abs, fy_mm_abs
-
-        # 準備顯示用的畫面（複製旋轉後的畫面來添加文字）
-        display_frame = frame_rotated.copy()
-        
-        # 疊字顯示（文字保持正常方向）
-        if self.origin_x is not None and np.isfinite(fx_mm_abs) and np.isfinite(fy_mm_abs):
-            rx = fx_mm_abs - self.origin_x
-            ry = fy_mm_abs - self.origin_y
-            pos_text = f"Pos(mm): ({rx:.2f}, {ry:.2f})"
-        else:
-            pos_text = f"Pos(mm): (NaN, NaN)"
-        cv2.putText(display_frame, pos_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
-        
-        if np.isfinite(ang_for_draw):
-            cv2.putText(display_frame, f"Angle: {ang_for_draw:+.2f} deg", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
-        else:
-            cv2.putText(display_frame, "Angle: NaN", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
-            
-        if np.isfinite(self.inst_speed):
-            cv2.putText(display_frame, f"Speed: {self.inst_speed:.2f} mm/s", (20,100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
-        else:
-            cv2.putText(display_frame, "Speed: NaN mm/s", (20,100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
-
-        # 函數產生器狀態顯示
-        fg_status = f"FG: Mode {self.fg_controller.current_mode}" if self.fg_controller.current_mode else "FG: OFF"
-        cv2.putText(display_frame, fg_status, (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
-
-        # 錄影狀態顯示 - 持續顯示REC指示器
-        if self.state == 1:  # RECORDING
-            # REC文字 - 放在右上角更明顯的位置，持續顯示
-            cv2.putText(display_frame, "REC", (CAM_HEIGHT-100, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 4)
-            # 紅色圓點指示器
-            cv2.circle(display_frame, (CAM_HEIGHT-130, 25), 8, (0,0,255), -1)
-        
-        # 狀態提示（由於畫面旋轉了，調整文字位置）
-        if self.state == 0:  # PREVIEW
-            # 旋轉後畫面尺寸變化，調整文字位置
-            cv2.putText(display_frame, "INTEGRATED PREVIEW - [SPACE] Start Recording, [1-4] FG Mode, [0] FG Off",
-                        (20, CAM_WIDTH-30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-
-        # 改善的FPS計算與錄影處理
-        if self.state == 1 and RECORD_OUTPUT:  # RECORD
-            ts_now = time.perf_counter()
-            self.ts_list.append(ts_now)
-            self.frame_timestamps.append(ts_now)
-            
-            # 計算實際FPS
-            if len(self.frame_timestamps) >= 2:
-                recent_dt = self.frame_timestamps[-1] - self.frame_timestamps[-2]
-                if recent_dt > 0:
-                    current_fps = 1.0 / recent_dt
-                    self.actual_fps_buffer.append(current_fps)
-            
-            if self.writer is None:
-                self.frame_buf.append(display_frame.copy())  # 使用包含文字的畫面
-                # 收集GIF幀（1:1還原，不降采樣）
-                if HAVE_PIL:
-                    gif_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                    # 縮小GIF尺寸以減少檔案大小
-                    gif_height, gif_width = gif_frame.shape[:2]
-                    new_width = min(gif_width, 480)
-                    new_height = int(gif_height * new_width / gif_width)
-                    gif_frame_resized = cv2.resize(gif_frame, (new_width, new_height))
-                    self.gif_frames.append(Image.fromarray(gif_frame_resized))
-                
-                if len(self.frame_buf) >= WARMUP_FRAMES_FOR_FPS and len(self.ts_list) >= WARMUP_FRAMES_FOR_FPS:
-                    # 使用實際測量的FPS而不是設備FPS
-                    if len(self.actual_fps_buffer) > 0:
-                        fps_out = float(np.median(list(self.actual_fps_buffer)))
-                    else:
-                        dt = np.diff(np.array(self.ts_list[-WARMUP_FRAMES_FOR_FPS:], dtype=float))
-                        dt = dt[dt > 0]
-                        fps_out = float(1.0 / np.median(dt)) if dt.size > 0 else 30.0
-                    
-                    # 限制FPS範圍，避免異常值
-                    fps_out = max(10.0, min(fps_out, 200.0))
-                    
-                    run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    self.output_dir = f"{run_tag}_{MODE}_integrated"
-                    os.makedirs(self.output_dir, exist_ok=True)
-                    self.out_path = os.path.join(self.output_dir, f"camera_{MODE}_tracked.mp4")
-                    self.gif_path = os.path.join(self.output_dir, f"camera_{MODE}_tracked.gif")
-                    
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    # 注意：由於畫面旋轉了90度，寬高要對調
-                    W = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))  # 旋轉後原高度變寬度
-                    H = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))   # 旋轉後原寬度變高度
-                    self.writer = cv2.VideoWriter(self.out_path, fourcc, fps_out, (W, H))
-                    
-                    print(f"錄影參數：FPS={fps_out:.1f}, 解析度={W}x{H}")
-                    
-                    for f in self.frame_buf:
-                        self.writer.write(f)
-                    self.frame_buf.clear()
-            else:
-                self.writer.write(display_frame)  # 寫入包含文字的畫面
-                
-                # 繼續收集GIF幀（1:1還原）
-                if HAVE_PIL:
-                    gif_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                    gif_height, gif_width = gif_frame.shape[:2]
-                    new_width = min(gif_width, 480)
-                    new_height = int(gif_height * new_width / gif_width)
-                    gif_frame_resized = cv2.resize(gif_frame, (new_width, new_height))
-                    self.gif_frames.append(Image.fromarray(gif_frame_resized))
-
-        # 記錄資料
-        if self.state == 1:  # RECORD
-            self.rec.append((
-                self.frame_idx, t_s,
-                fx, fy,
-                fx_mm_abs, fy_mm_abs,
-                float(ang_for_draw) if np.isfinite(ang_for_draw) else np.nan,
-                self.mm_per_px
-            ))
-
-        self.frame_idx += 1
-        
-        return display_frame
 
 def show_help():
-    """顯示幫助信息"""
-    print("\n" + "="*60)
-    print("整合式攝影機追蹤與函數產生器控制系統")
-    print("="*60)
-    print("攝影機控制：")
-    print("  [Space]     - 開始/停止錄製")
-    print("  [ESC/Q]     - 退出程式")
-    print("")
-    print("函數產生器控制：")
-    print("  [1]         - Mode 1 (25k Hz, CH1=NORM, CH2=INV)")
-    print("  [2]         - Mode 2 (47k Hz, CH1=NORM, CH2=INV)")
-    print("  [3]         - Mode 3 (25k Hz, CH1=INV, CH2=NORM)")
-    print("  [4]         - Mode 4 (47k Hz, CH1=INV, CH2=NORM)")
-    print("  [0]         - 關閉函數產生器輸出")
-    print("")
-    print("其他：")
-    print("  [H]         - 顯示此幫助")
-    print("="*60)
+    """顯示幫助資訊"""
+    help_text = """
+=== 整合式攝影機追蹤與函數產生器控制 ===
+
+攝影機控制：
+  [Space]  開始/停止錄製
+  [ESC/Q]  退出程式
+
+函數產生器控制：
+  [1]      切換到模式 1 (25kHz, CH1=NORM, CH2=INV)
+  [2]      切換到模式 2 (47kHz, CH1=NORM, CH2=INV)  
+  [3]      切換到模式 3 (25kHz, CH1=INV, CH2=NORM)
+  [4]      切換到模式 4 (47kHz, CH1=INV, CH2=NORM)
+  [0]      關閉輸出
+
+其他：
+  [H]      顯示此幫助
+  [M]      切換操作模式
+
+設備規格：
+  - 設備尺寸：9mm × 6mm (紅色框線)
+  - 網格間距：5mm × 5mm
+  - FPS：實際測量（修正假設120FPS問題）
+
+修正重點：
+  ✓ 使用實際時間戳記而非假設FPS
+  ✓ 基於5mm網格的準確比例計算
+  ✓ 9mm×6mm設備尺寸驗證
+  ✓ 改進的速度計算（position/實際時間）
+"""
+    print(help_text)
 
 def main():
-    """主程式"""
-    print("="*60)
-    print("整合式攝影機追蹤與函數產生器控制系統")
-    print("="*60)
+    """主函數"""
+    print("=== 整合式攝影機追蹤與函數產生器控制系統 ===")
+    print("初始化中...")
     
-    # 初始化函數產生器
+    # 初始化函數產生器控制器
     fg_controller = FunctionGeneratorController()
     fg_connected = fg_controller.connect()
     
     # 初始化攝影機追蹤器
-    camera_tracker = CameraTracker(fg_controller)
+    tracker = CameraTracker(fg_controller)
     
     try:
-        camera_tracker.initialize_camera()
+        if not tracker.initialize_camera():
+            print("攝影機初始化失敗")
+            return
         
-        # 顯示幫助
+        print("✓ 系統初始化完成")
         show_help()
         
-        print(f"\n系統狀態：")
-        print(f"✓ 攝影機：已連接")
-        print(f"{'✓' if fg_connected else '✗'} 函數產生器：{'已連接' if fg_connected else '未連接'}")
-        print(f"\n系統就緒！")
+        print(f"\n攝影機規格:")
+        print(f"- 解析度: {CAM_WIDTH}×{CAM_HEIGHT}")
+        print(f"- 設定FPS: {CAM_FPS_REQ}")
+        print(f"- 實際測量FPS: 即時計算")
+        print(f"- 設備尺寸: {DEVICE_WIDTH_MM}mm × {DEVICE_HEIGHT_MM}mm")
+        print(f"- 網格間距: {GRID_SPACING_MM}mm × {GRID_SPACING_MM}mm")
+        print(f"- 比例: {tracker.mm_per_px:.4f} mm/px")
+        
+        if fg_connected:
+            print(f"\n函數產生器: 已連接並準備就緒")
+        else:
+            print(f"\n函數產生器: 未連接 (僅攝影機模式)")
+        
+        print("\n按 [H] 查看操作指南，[Space] 開始錄製...")
         
         # 主迴圈
         while True:
-            ok, frame = camera_tracker.cap.read()
-            if not ok:
+            ret, frame = tracker.cap.read()
+            if not ret:
+                print("攝影機讀取失敗")
                 break
             
             # 處理幀
-            frame = camera_tracker.process_frame(frame)
-            
-            # 縮放顯示畫面
-            if DISPLAY_SCALE != 1.0:
-                display_height, display_width = int(frame.shape[0] * DISPLAY_SCALE), int(frame.shape[1] * DISPLAY_SCALE)
-                frame_display = cv2.resize(frame, (display_width, display_height))
-            else:
-                frame_display = frame
+            display_frame = tracker.process_frame(frame)
             
             # 顯示
-            cv2.imshow(WINDOW_TITLE, frame_display)
+            cv2.imshow(WINDOW_TITLE, display_frame)
             
-            # 按鍵處理
+            # 鍵盤輸入處理
             key = cv2.waitKey(1) & 0xFF
             
-            if key in (27, ord('q')):  # ESC 或 Q 退出
-                break
-            elif key == 32:  # Space 開始/停止錄製
-                if camera_tracker.state == 0:
-                    camera_tracker.state = 1
-                    print("開始錄製...")
+            if key == ord(' '):  # Space - 開始/停止錄製
+                if tracker.state == 0:
+                    tracker.start_recording()
                 else:
-                    camera_tracker.state = 0
-                    print("錄製結束")
-                    # 立即關閉函數產生器
-                    if fg_connected:
-                        fg_controller.turn_off()
-                        print("函數產生器已立即關閉")
-                    break
-            elif key == ord('h'):  # 顯示幫助
+                    tracker.stop_recording()
+            
+            elif key == ord('h') or key == ord('H'):  # H - 幫助
                 show_help()
-            elif key == ord('0'):  # 關閉函數產生器
-                if fg_connected:
+            
+            elif key == ord('q') or key == 27:  # Q or ESC - 退出
+                break
+            
+            elif key == ord('m') or key == ord('M'):  # M - 切換操作模式
+                print("模式切換功能預留")
+            
+            # 函數產生器控制
+            elif fg_connected:
+                if key == ord('1'):
+                    fg_controller.switch_mode(1)
+                elif key == ord('2'):
+                    fg_controller.switch_mode(2)
+                elif key == ord('3'):
+                    fg_controller.switch_mode(3)
+                elif key == ord('4'):
+                    fg_controller.switch_mode(4)
+                elif key == ord('0'):
                     fg_controller.turn_off()
-            elif key in [ord('1'), ord('2'), ord('3'), ord('4')]:  # 函數產生器模式切換
-                if fg_connected:
-                    mode_num = int(chr(key))
-                    fg_controller.switch_mode(mode_num)
-                else:
-                    print("函數產生器未連接")
     
+    except KeyboardInterrupt:
+        print("\n程式被使用者中斷")
     except Exception as e:
-        print(f"系統錯誤：{e}")
-    
+        print(f"程式發生錯誤：{e}")
     finally:
-        # 收尾：確保 writer 被正確關閉
-        camera_tracker.cap.release()
-        # 若在 RECORDING 但 writer 尚未建立，補建、估 FPS 後寫出緩衝
-        if camera_tracker.state == 1 and RECORD_OUTPUT and camera_tracker.writer is None and len(camera_tracker.frame_buf) > 0:
-            dt_all = np.diff(np.array(camera_tracker.ts_list, dtype=float))
-            dt_all = dt_all[dt_all > 0]
-            fps_device = camera_tracker.cap.get(cv2.CAP_PROP_FPS) or float(CAM_FPS_REQ)
-            fps_out = float(1.0 / np.median(dt_all)) if dt_all.size > 0 else (fps_device or 30.0)
-            
-            run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-            camera_tracker.output_dir = f"{run_tag}_{MODE}_integrated"
-            os.makedirs(camera_tracker.output_dir, exist_ok=True)
-            camera_tracker.out_path = os.path.join(camera_tracker.output_dir, f"camera_{MODE}_tracked.mp4")
-            
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            W = int(CAM_WIDTH)
-            H = int(CAM_HEIGHT)
-            camera_tracker.writer = cv2.VideoWriter(camera_tracker.out_path, fourcc, fps_out, (W, H))
-            for f in camera_tracker.frame_buf:
-                camera_tracker.writer.write(f)
-            camera_tracker.frame_buf.clear()
-        
-        if camera_tracker.writer is not None:
-            camera_tracker.writer.release()
-        cv2.destroyAllWindows()
-
-        # 資料處理和輸出（如果有錄製資料）
-        if len(camera_tracker.rec) > 0:
-            print("\n正在處理和輸出資料...")
-            process_and_export_data(camera_tracker)
-        else:
-            print("未開始錄影，沒有輸出。")
-        
         # 清理資源
-        print("\n清理資源...")
-        camera_tracker.cleanup_camera()
-        fg_controller.disconnect()
-        print("程式結束")
-
-def process_and_export_data(camera_tracker):
-    """處理並輸出追蹤資料 - 生成 CSV 和圖表"""
-    if len(camera_tracker.rec) == 0:
-        print("沒有追蹤資料可輸出")
-        return
-    
-    # 使用已建立的輸出目錄，如果沒有則建立新的
-    if camera_tracker.output_dir and os.path.exists(camera_tracker.output_dir):
-        output_dir = camera_tracker.output_dir
-    else:
-        run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = f"{run_tag}_{MODE}_integrated"
-        os.makedirs(output_dir, exist_ok=True)
-    OUT_PREFIX = f"camera_{MODE}"
-    
-    # 整理資料為 DataFrame
-    df = pd.DataFrame(camera_tracker.rec, columns=[
-        "frame","t_s","x_px_filt","y_px_filt","x_mm_abs","y_mm_abs","angle_deg_raw","mm_per_px"
-    ])
-    
-    # 計算相對起點座標 - 修正Y座標正負號
-    x_abs = df["x_mm_abs"].to_numpy()
-    y_abs = df["y_mm_abs"].to_numpy()
-    valid = np.isfinite(x_abs) & np.isfinite(y_abs)
-    if valid.any():
-        x0, y0 = x_abs[valid][0], y_abs[valid][0]
-        df["x_mm"] = x_abs - x0
-        # 修正Y座標正負號 - 加負號
-        df["y_mm"] = -(y_abs - y0)
-    else:
-        df["x_mm"] = x_abs
-        df["y_mm"] = -y_abs  # 也對絕對座標加負號
-    
-    # 可選：Savitzky–Golay 平滑座標
-    USE_SG_POS = False  # 可以根據需要調整
-    SG_WIN = 7
-    SG_POLY = 2
-    if USE_SG_POS and HAVE_SG and len(df) >= SG_WIN:
-        df["x_mm"] = savgol_filter(df["x_mm"].to_numpy(), SG_WIN, SG_POLY, mode="interp")
-        df["y_mm"] = savgol_filter(df["y_mm"].to_numpy(), SG_WIN, SG_POLY, mode="interp")
-    
-    # 角度處理
-    ang_raw = df["angle_deg_raw"].to_numpy()
-    mask_ang = np.isfinite(ang_raw)
-    ang_unwrap = np.full_like(ang_raw, np.nan, dtype=float)
-    if mask_ang.any():
-        ang_unwrap[mask_ang] = unwrap_angles_deg(ang_raw[mask_ang])
-        ang_unwrap = moving_average(ang_unwrap, 5)
-    df["angle_deg_unwrapped"] = ang_unwrap
-    
-    # 角速度計算
-    t = df["t_s"].to_numpy()
-    ang_vel = np.full_like(ang_unwrap, np.nan, dtype=float)
-    idx = np.where(mask_ang)[0]
-    if len(idx) >= 2:
-        for i0, i1 in zip(idx[:-1], idx[1:]):
-            dt = t[i1] - t[i0]
-            if dt > 0:
-                ang_vel[i1] = (ang_unwrap[i1] - ang_unwrap[i0]) / dt
-        ang_vel = moving_average(ang_vel, 5)
-    df["angular_vel_dps"] = ang_vel
-    
-    # 線速度計算
-    vx = finite_diff(df["x_mm"].to_numpy(), t, smooth_win=5)
-    vy = finite_diff(df["y_mm"].to_numpy(), t, smooth_win=5)
-    speed = np.sqrt(vx**2 + vy**2)
-    df["vx_mm_s"] = vx
-    df["vy_mm_s"] = vy
-    df["speed_mm_s"] = speed
-    
-    # 輸出 CSV
-    csv_path = os.path.join(output_dir, f"{OUT_PREFIX}_pos_angle_speed.csv")
-    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
-    
-    # 生成圖表
-    plot_paths = generate_plots(df, output_dir, OUT_PREFIX)
-    
-    # 輸出訊息（與 real_time_camera.py 格式一致）
-    # 生成GIF檔案 - 修正1:1播放速度問題
-    if HAVE_PIL and len(camera_tracker.gif_frames) > 0 and camera_tracker.gif_path:
-        print("正在生成GIF檔案...")
-        try:
-            total_gif_frames = len(camera_tracker.gif_frames)
-            
-            if len(camera_tracker.rec) > 0 and total_gif_frames > 0:
-                # 計算真實的每幀時間間隔（毫秒）
-                total_time_s = camera_tracker.rec[-1][1] - camera_tracker.rec[0][1]
-                duration_per_frame = int((total_time_s * 1000) / total_gif_frames)
-                # 限制範圍：最小8ms(125fps)，最大500ms(2fps)
-                duration_per_frame = max(8, min(duration_per_frame, 500))
-            else:
-                # 預設60fps
-                duration_per_frame = 17  # 約60fps
-            
-            camera_tracker.gif_frames[0].save(
-                camera_tracker.gif_path,
-                save_all=True,
-                append_images=camera_tracker.gif_frames[1:],
-                duration=duration_per_frame,
-                loop=0,
-                optimize=True
-            )
-            print(f"✓ GIF已生成：{camera_tracker.gif_path} (幀間隔: {duration_per_frame}ms, 與原影片1:1播放)")
-        except Exception as e:
-            print(f"✗ GIF生成失敗：{e}")
-    
-    print(f"[輸出] 目錄：{output_dir}")
-    print(f"[輸出] CSV：{csv_path}")
-    print(f"[輸出] Position 圖：{plot_paths['position']}")
-    if MODE.lower() == "straight":
-        print(f"[輸出] Speed/Orientation 圖：{plot_paths['speed_orientation']}")
-    else:
-        print(f"[輸出] Angular Speed 圖：{plot_paths['angular_speed']}")
-    if RECORD_OUTPUT and camera_tracker.out_path and os.path.exists(camera_tracker.out_path):
-        print(f"[輸出] 追蹤影片：{camera_tracker.out_path}")
-    if HAVE_PIL and camera_tracker.gif_path and os.path.exists(camera_tracker.gif_path):
-        print(f"[輸出] 追蹤GIF：{camera_tracker.gif_path}")
-    
-    print(f"\n✓ 已成功輸出檔案：")
-    print(f"  1. 追蹤影片：{os.path.basename(camera_tracker.out_path) if camera_tracker.out_path else 'N/A'}")
-    if HAVE_PIL and camera_tracker.gif_path:
-        print(f"  2. 追蹤GIF：{os.path.basename(camera_tracker.gif_path)}")
-    print(f"  3. 位置圖表：{os.path.basename(plot_paths['position'])}")
-    if MODE.lower() == "straight":
-        print(f"  4. 速度/角度圖表：{os.path.basename(plot_paths['speed_orientation'])}")
-    else:
-        print(f"  4. 角速度圖表：{os.path.basename(plot_paths['angular_speed'])}")
-    print(f"  5. CSV 資料檔：{os.path.basename(csv_path)}")
-    
-def generate_plots(df, output_dir, OUT_PREFIX):
-    """生成追蹤結果圖表"""
-    
-    plot_paths = {}
-    
-    # A) 位置軌跡圖
-    figA, ax_pos = plt.subplots(1, 1, figsize=(7, 6), constrained_layout=True)
-    x_plot = df["x_mm"].to_numpy()
-    y_plot = df["y_mm"].to_numpy()
-    ax_pos.plot(x_plot, y_plot, lw=2, label="Trajectory")
-    
-    # 標記起點和終點
-    valid_pos = np.vstack([x_plot, y_plot]).T
-    valid_pos = valid_pos[~np.isnan(valid_pos).any(axis=1)]
-    if len(valid_pos) > 0:
-        ax_pos.scatter([valid_pos[0,0]], [valid_pos[0,1]], s=100, c="green", marker="o", label="Start", zorder=5)
-        ax_pos.scatter([valid_pos[-1,0]], [valid_pos[-1,1]], s=100, c="red", marker="o", label="End", zorder=5)
-        
-        # 設定座標軸範圍
-        xmin, xmax = np.nanmin(x_plot), np.nanmax(x_plot)
-        ymin, ymax = np.nanmin(y_plot), np.nanmax(y_plot)
-        xc = 0.5*(xmin+xmax)
-        yc = 0.5*(ymin+ymax)
-        half = 0.5*max(xmax-xmin, ymax-ymin)
-        half = max(half, 1e-6)*PLOT_RANGE_SCALE
-        ax_pos.set_xlim(xc-half, xc+half)
-        ax_pos.set_ylim(yc-half, yc+half)
-    
-    if INVERT_Y_AXIS:
-        ax_pos.invert_yaxis()
-    ax_pos.set_aspect("equal", adjustable="box")
-    ax_pos.set_xlabel("x (mm)")
-    ax_pos.set_ylabel("y (mm)")
-    ax_pos.set_title("Position (Trajectory)")
-    ax_pos.grid(True, linestyle="--", alpha=0.4)
-    ax_pos.legend(loc="best")
-    
-    plot_pos_path = os.path.join(output_dir, f"{OUT_PREFIX}_position.png")
-    figA.savefig(plot_pos_path, dpi=220)
-    plt.close(figA)
-    plot_paths['position'] = plot_pos_path
-    
-    # B) 速度和角度圖
-    if MODE.lower() == "straight":
-        figB, (ax_s, ax_a) = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
-        
-        # 左圖：速度
-        ax_s.plot(df["t_s"], df["speed_mm_s"], lw=2, label="Speed (mm/s)")
-        sp_all = df["speed_mm_s"].to_numpy()
-        tt = df["t_s"].to_numpy()
-        finite = np.isfinite(sp_all)
-        if np.any(finite):
-            i_max = np.nanargmax(sp_all)
-            ax_s.plot([tt[i_max]], [sp_all[i_max]], marker="o", markersize=8, color="red",
-                      label=f"Max: {sp_all[i_max]:.2f} mm/s @ {tt[i_max]:.2f}s")
-        ax_s.set_xlabel("Time (s)")
-        ax_s.set_ylabel("Speed (mm/s)")
-        ax_s.set_title("Speed vs Time")
-        ax_s.grid(True, linestyle="--", alpha=0.4)
-        ax_s.legend(loc="best")
-        
-        # 右圖：角度
-        if ORIENT_PLOT_WRAPPED:
-            ang_vis = wrap_angles_deg(df["angle_deg_unwrapped"].to_numpy())
-        else:
-            ang_vis = df["angle_deg_unwrapped"].to_numpy()
-        
-        if np.isfinite(ang_vis).any():
-            first_idx = np.where(np.isfinite(ang_vis))[0][0]
-            ang0 = float(ang_vis[first_idx])
-            offset_series = wrap_angles_deg(ang_vis - ang0)
-            avg_offset_deg = float(np.nanmean(offset_series))
-        else:
-            avg_offset_deg = float("nan")
-        
-        label_orient = f"Orientation (deg)\nAvg offset: {avg_offset_deg:.2f}°" if np.isfinite(avg_offset_deg) else "Orientation (deg)"
-        ax_a.plot(df["t_s"], ang_vis, lw=2, label=label_orient)
-        ax_a.set_xlabel("Time (s)")
-        ax_a.set_ylabel("Angle (deg)")
-        ax_a.set_title("Orientation vs Time")
-        if ORIENT_YLIM_DEG is not None and np.isfinite(ORIENT_YLIM_DEG):
-            ylim = float(ORIENT_YLIM_DEG)
-            ax_a.set_ylim(-ylim, +ylim)
-        ax_a.grid(True, linestyle="--", alpha=0.4)
-        ax_a.legend(loc="best")
-        
-        plot_so_path = os.path.join(output_dir, f"{OUT_PREFIX}_speed_orientation.png")
-        figB.savefig(plot_so_path, dpi=220)
-        plt.close(figB)
-        plot_paths['speed_orientation'] = plot_so_path
-        
-    else:  # rotation mode
-        figW, ax_w = plt.subplots(1, 1, figsize=(8, 6), constrained_layout=True)
-        ax_w.plot(df["t_s"], df["angular_vel_dps"], lw=2, label="Angular speed (deg/s)")
-        
-        w_all = df["angular_vel_dps"].to_numpy()
-        tt = df["t_s"].to_numpy()
-        finite = np.isfinite(w_all)
-        if np.any(finite):
-            idx_rel = int(np.nanargmax(np.abs(w_all[finite])))
-            idxs = np.where(finite)[0]
-            i_max = idxs[idx_rel]
-            ax_w.plot([tt[i_max]], [w_all[i_max]], marker="o", markersize=8, color="red",
-                      label=f"Max: {w_all[i_max]:.2f} deg/s @ {tt[i_max]:.2f}s")
-        
-        ax_w.set_xlabel("Time (s)")
-        ax_w.set_ylabel("Angular speed (deg/s)")
-        ax_w.set_title("Angular Speed vs Time")
-        ax_w.grid(True, linestyle="--", alpha=0.4)
-        ax_w.legend(loc="best")
-        
-        plot_w_path = os.path.join(output_dir, f"{OUT_PREFIX}_angular_speed.png")
-        figW.savefig(plot_w_path, dpi=220)
-        plt.close(figW)
-        plot_paths['angular_speed'] = plot_w_path
-    
-    return plot_paths
+        print("正在清理資源...")
+        tracker.cleanup()
+        if fg_connected:
+            fg_controller.disconnect()
+        print("✓ 程式已退出")
 
 if __name__ == "__main__":
     main()
