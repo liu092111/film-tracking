@@ -41,13 +41,6 @@ try:
 except Exception:
     HAVE_SG = False
 
-# GIF 輸出相關
-try:
-    from PIL import Image
-    HAVE_PIL = True
-except ImportError:
-    HAVE_PIL = False
-    print("警告：未安裝 PIL/Pillow，GIF 輸出功能將被禁用")
 
 # ========== 攝影機設定 ==========
 MODE              = "straight"
@@ -516,8 +509,6 @@ class CameraTracker:
         self.state = 0  # 0=PREVIEW, 1=RECORD
         self.output_dir = None  # 儲存輸出目錄路徑
         self.out_path = None    # 儲存影片檔案路徑
-        self.gif_frames = []    # 儲存 GIF 用的幀
-        self.gif_path = None    # 儲存 GIF 檔案路徑
         
         # 改善 FPS 計算 - 增加緩衝區大小以收集更多數據
         self.fps_estimation_buffer = deque(maxlen=300)  # FPS 估算緩衝區
