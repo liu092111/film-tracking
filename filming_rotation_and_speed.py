@@ -203,6 +203,7 @@ def main():
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     rec = []  # frame, t_s, x_px_filt, y_px_filt, x_mm, y_mm, angle_deg_raw, mm_per_px
+    rec_corners = []  # 記錄四個頂點的座標 (frame, t_s, c1_x_mm, c1_y_mm, c2_x_mm, c2_y_mm, c3_x_mm, c3_y_mm, c4_x_mm, c4_y_mm)
     frame_idx = 0
 
     # 疊字即時線速度（mm/s）
@@ -222,6 +223,7 @@ def main():
         pred = kf.predict()
         meas = find_target_and_angle(frame)
         angle_deg = np.nan
+        corners_mm = [np.nan] * 8  # 4個頂點的 x, y 座標（mm）
 
         if meas is not None:
             cx, cy, x, y, wbox, hbox, angle_deg, cnt = meas
@@ -232,6 +234,14 @@ def main():
             cv2.drawContours(frame, [cnt], -1, (0, 0, 255), 4)
             if np.isfinite(fx) and np.isfinite(fy):
                 cv2.circle(frame, (int(round(fx)), int(round(fy))), 6, (0,255,0), -1)
+            
+            # 計算旋轉矩形的四個頂點
+            rect = cv2.minAreaRect(cnt)
+            box_points = cv2.boxPoints(rect)  # 返回4個頂點座標 (x, y)
+            # 將頂點轉換為 mm 單位
+            for i, (px, py) in enumerate(box_points):
+                corners_mm[i*2] = px * mm_per_px
+                corners_mm[i*2 + 1] = py * mm_per_px
         else:
             fx = fy = np.nan
 
@@ -264,8 +274,10 @@ def main():
 
         writer.write(frame)
 
-        # 記錄
+        # 記錄中心點
         rec.append((frame_idx, t_s, fx, fy, fx_mm, fy_mm, angle_deg, mm_per_px))
+        # 記錄四個頂點
+        rec_corners.append([frame_idx, t_s] + corners_mm)
         frame_idx += 1
 
     cap.release()
@@ -274,6 +286,13 @@ def main():
     # ---- 匯總為 DataFrame ----
     df = pd.DataFrame(rec, columns=[
         "frame","t_s","x_px_filt","y_px_filt","x_mm","y_mm","angle_deg_raw","mm_per_px"
+    ])
+    
+    # 四個頂點的 DataFrame
+    df_corners = pd.DataFrame(rec_corners, columns=[
+        "frame","t_s",
+        "c1_x_mm","c1_y_mm","c2_x_mm","c2_y_mm",
+        "c3_x_mm","c3_y_mm","c4_x_mm","c4_y_mm"
     ])
 
     # === 將座標平移，使起點為 (0, 0) ===
@@ -284,6 +303,11 @@ def main():
         x0, y0 = x_abs[valid][0], y_abs[valid][0]
         df["x_mm"] = x_abs - x0
         df["y_mm"] = y_abs - y0
+        
+        # 對四個頂點也進行相同的平移
+        for i in range(1, 5):
+            df_corners[f"c{i}_x_mm"] = df_corners[f"c{i}_x_mm"] - x0
+            df_corners[f"c{i}_y_mm"] = df_corners[f"c{i}_y_mm"] - y0
     else:
         df["x_mm"] = x_abs
         df["y_mm"] = y_abs
@@ -397,6 +421,66 @@ def main():
     figW.savefig(plot_w_path, dpi=220)
     plt.close(figW)
     print(f"[輸出] 圖片：{plot_w_path}")
+
+    # C) 五點軌跡圖（4個頂點用虛線 + 中心用實線）
+    figC, ax_five = plt.subplots(1, 1, figsize=(7, 6), constrained_layout=True)
+    
+    # 繪製四個頂點的軌跡（虛線、更明顯的顏色）
+    corner_colors = ['cyan', 'magenta', 'lime', 'orange']  # 使用更明顯的顏色
+    corner_labels = ['Corner 1', 'Corner 2', 'Corner 3', 'Corner 4']
+    
+    for i in range(1, 5):
+        x_corner = df_corners[f"c{i}_x_mm"].to_numpy()
+        y_corner = df_corners[f"c{i}_y_mm"].to_numpy()
+        ax_five.plot(x_corner, y_corner, linestyle='--', linewidth=2.0,  # 增加線寬
+                    color=corner_colors[i-1], alpha=0.7, label=corner_labels[i-1])
+    
+    # 繪製中心點軌跡（實線，較粗）
+    ax_five.plot(x_plot, y_plot, lw=3.0, color='blue', label="Center", zorder=5)
+    
+    # 標記起點和終點
+    valid_pos = np.vstack([x_plot, y_plot]).T
+    valid_pos = valid_pos[~np.isnan(valid_pos).any(axis=1)]
+    if len(valid_pos) > 0:
+        x_start, y_start = valid_pos[0,0], valid_pos[0,1]
+        x_end,   y_end   = valid_pos[-1,0], valid_pos[-1,1]
+        ax_five.scatter([x_start], [y_start], s=120, c="green", marker="o", 
+                       label="Start", zorder=10, edgecolors='black', linewidths=2)
+        ax_five.scatter([x_end],   [y_end],   s=120, c="red",   marker="o", 
+                       label="End",   zorder=10, edgecolors='black', linewidths=2)
+        
+        # 自動視窗 - 考慮所有點（中心+頂點）
+        all_x = [x_plot]
+        all_y = [y_plot]
+        for i in range(1, 5):
+            all_x.append(df_corners[f"c{i}_x_mm"].to_numpy())
+            all_y.append(df_corners[f"c{i}_y_mm"].to_numpy())
+        
+        all_x = np.concatenate(all_x)
+        all_y = np.concatenate(all_y)
+        
+        xmin, xmax = np.nanmin(all_x), np.nanmax(all_x)
+        ymin, ymax = np.nanmin(all_y), np.nanmax(all_y)
+        xc = 0.5 * (xmin + xmax)
+        yc = 0.5 * (ymin + ymax)
+        half = 0.5 * max(xmax - xmin, ymax - ymin)
+        half = max(half, 1e-6) * 1.35
+        ax_five.set_xlim(xc - half, xc + half)
+        ax_five.set_ylim(yc - half, yc + half)
+    
+    if INVERT_Y_AXIS:
+        ax_five.invert_yaxis()
+    ax_five.set_aspect("equal", adjustable="box")
+    ax_five.set_xlabel("x (mm)")
+    ax_five.set_ylabel("y (mm)")
+    ax_five.set_title("5-Point Trajectory (4 Corners + Center)")
+    ax_five.grid(True, linestyle="--", alpha=0.4)
+    ax_five.legend(loc="best", fontsize=8)
+    
+    plot_five_path = os.path.join(output_dir, f"{OUT_PREFIX}_five_points_trajectory.png")
+    figC.savefig(plot_five_path, dpi=220)
+    plt.close(figC)
+    print(f"[輸出] 圖片：{plot_five_path}")
 
     print(f"\n所有輸出檔案已整理至資料夾：{output_dir}")
 
