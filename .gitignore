@@ -1,0 +1,33 @@
+# Video files
+*.mov
+*.mp4
+*.avi
+*.gif
+
+# Large data files
+*.dat
+
+# Analysis output directories
+*_analysis_output/
+*_integrated/
+*_integrated_mt/
+*_integrated_mt_pid/
+*_pid_*/
+*_experiment/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
