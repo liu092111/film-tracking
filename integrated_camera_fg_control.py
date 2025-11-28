@@ -892,15 +892,6 @@ class CameraTracker:
                     self.frame_buf.clear()
             else:
                 self.writer.write(display_frame)  # 寫入包含文字的畫面
-                
-                # 繼續收集GIF幀（1:1還原）
-                if HAVE_PIL:
-                    gif_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                    gif_height, gif_width = gif_frame.shape[:2]
-                    new_width = min(gif_width, 480)
-                    new_height = int(gif_height * new_width / gif_width)
-                    gif_frame_resized = cv2.resize(gif_frame, (new_width, new_height))
-                    self.gif_frames.append(Image.fromarray(gif_frame_resized))
 
         # 記錄資料
         if self.state == 1:  # RECORD
@@ -1128,35 +1119,7 @@ def process_and_export_data(camera_tracker):
     # 生成圖表
     plot_paths = generate_plots(df, output_dir, OUT_PREFIX)
     
-    # 輸出訊息（與 real_time_camera.py 格式一致）
-    # 生成GIF檔案 - 修正1:1播放速度問題
-    if HAVE_PIL and len(camera_tracker.gif_frames) > 0 and camera_tracker.gif_path:
-        print("正在生成GIF檔案...")
-        try:
-            total_gif_frames = len(camera_tracker.gif_frames)
-            
-            if len(camera_tracker.rec) > 0 and total_gif_frames > 0:
-                # 計算真實的每幀時間間隔（毫秒）
-                total_time_s = camera_tracker.rec[-1][1] - camera_tracker.rec[0][1]
-                duration_per_frame = int((total_time_s * 1000) / total_gif_frames)
-                # 限制範圍：最小8ms(125fps)，最大500ms(2fps)
-                duration_per_frame = max(8, min(duration_per_frame, 500))
-            else:
-                # 預設60fps
-                duration_per_frame = 17  # 約60fps
-            
-            camera_tracker.gif_frames[0].save(
-                camera_tracker.gif_path,
-                save_all=True,
-                append_images=camera_tracker.gif_frames[1:],
-                duration=duration_per_frame,
-                loop=0,
-                optimize=True
-            )
-            print(f"✓ GIF已生成：{camera_tracker.gif_path} (幀間隔: {duration_per_frame}ms, 與原影片1:1播放)")
-        except Exception as e:
-            print(f"✗ GIF生成失敗：{e}")
-    
+    # 輸出訊息
     print(f"[輸出] 目錄：{output_dir}")
     print(f"[輸出] CSV：{csv_path}")
     print(f"[輸出] Position 圖：{plot_paths['position']}")
@@ -1166,19 +1129,15 @@ def process_and_export_data(camera_tracker):
         print(f"[輸出] Angular Speed 圖：{plot_paths['angular_speed']}")
     if RECORD_OUTPUT and camera_tracker.out_path and os.path.exists(camera_tracker.out_path):
         print(f"[輸出] 追蹤影片：{camera_tracker.out_path}")
-    if HAVE_PIL and camera_tracker.gif_path and os.path.exists(camera_tracker.gif_path):
-        print(f"[輸出] 追蹤GIF：{camera_tracker.gif_path}")
     
     print(f"\n✓ 已成功輸出檔案：")
     print(f"  1. 追蹤影片：{os.path.basename(camera_tracker.out_path) if camera_tracker.out_path else 'N/A'}")
-    if HAVE_PIL and camera_tracker.gif_path:
-        print(f"  2. 追蹤GIF：{os.path.basename(camera_tracker.gif_path)}")
-    print(f"  3. 位置圖表：{os.path.basename(plot_paths['position'])}")
+    print(f"  2. 位置圖表：{os.path.basename(plot_paths['position'])}")
     if MODE.lower() == "straight":
-        print(f"  4. 速度/角度圖表：{os.path.basename(plot_paths['speed_orientation'])}")
+        print(f"  3. 速度/角度圖表：{os.path.basename(plot_paths['speed_orientation'])}")
     else:
-        print(f"  4. 角速度圖表：{os.path.basename(plot_paths['angular_speed'])}")
-    print(f"  5. CSV 資料檔：{os.path.basename(csv_path)}")
+        print(f"  3. 角速度圖表：{os.path.basename(plot_paths['angular_speed'])}")
+    print(f"  4. CSV 資料檔：{os.path.basename(csv_path)}")
     
 def generate_plots(df, output_dir, OUT_PREFIX):
     """生成追蹤結果圖表"""
