@@ -861,15 +861,6 @@ class CameraTracker:
             
             if self.writer is None:
                 self.frame_buf.append(display_frame.copy())  # 使用包含文字的畫面
-                # 收集GIF幀（1:1還原，不降采樣）
-                if HAVE_PIL:
-                    gif_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                    # 縮小GIF尺寸以減少檔案大小
-                    gif_height, gif_width = gif_frame.shape[:2]
-                    new_width = min(gif_width, 480)
-                    new_height = int(gif_height * new_width / gif_width)
-                    gif_frame_resized = cv2.resize(gif_frame, (new_width, new_height))
-                    self.gif_frames.append(Image.fromarray(gif_frame_resized))
                 
                 if len(self.frame_buf) >= WARMUP_FRAMES_FOR_FPS and len(self.ts_list) >= WARMUP_FRAMES_FOR_FPS:
                     # 使用實際測量的FPS而不是設備FPS
@@ -887,7 +878,6 @@ class CameraTracker:
                     self.output_dir = f"{run_tag}_{MODE}_integrated"
                     os.makedirs(self.output_dir, exist_ok=True)
                     self.out_path = os.path.join(self.output_dir, f"camera_{MODE}_tracked.mp4")
-                    self.gif_path = os.path.join(self.output_dir, f"camera_{MODE}_tracked.gif")
                     
                     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                     # 注意：由於畫面旋轉了90度，寬高要對調
