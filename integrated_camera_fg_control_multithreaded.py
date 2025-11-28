@@ -38,7 +38,6 @@ try:
 except Exception:
     HAVE_SG = False
 
-
 # ========== 攝影機設定 ==========
 MODE              = "straight"
 CAMERA_INDEX      = 1
