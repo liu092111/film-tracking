@@ -38,13 +38,6 @@ try:
 except Exception:
     HAVE_SG = False
 
-# GIF 輸出相關
-try:
-    from PIL import Image
-    HAVE_PIL = True
-except ImportError:
-    HAVE_PIL = False
-    print("警告：未安裝 PIL/Pillow，GIF 輸出功能將被禁用")
 
 # ========== 攝影機設定 ==========
 MODE              = "straight"
@@ -962,8 +955,6 @@ def main():
     writer_raw = None  # 原始影片（無標註）
     rec_data = []
     output_dir = None
-    gif_frames = []
-    raw_frames = []  # 原始幀
     
     try:
         while running[0]:
@@ -999,16 +990,9 @@ def main():
                     
                     writer.write(frame)
                     
-                    # 從result queue 取得原始旋轉後的幀（無標註）
-                    # 需要在 process_thread 中也傳送原始幀
+                    # 寫入原始影片（無標註）
                     if 'raw_frame' in data:
                         writer_raw.write(data['raw_frame'])
-                        raw_frames.append(data['raw_frame'])
-                    
-                    # 收集 GIF 幀（完整大小，1:1 對應 MP4）
-                    if HAVE_PIL:
-                        gif_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        gif_frames.append(Image.fromarray(gif_frame))
                     
                     # 記錄資料
                     rec_data.append((
@@ -1071,7 +1055,7 @@ def main():
         # 輸出資料
         if len(rec_data) > 0 and output_dir:
             print("\n處理資料並輸出...")
-            process_and_export_data(rec_data, output_dir, mm_per_px, gif_frames)
+            process_and_export_data(rec_data, output_dir, mm_per_px)
         
         # 斷開函數產生器
         fg_controller.disconnect()
@@ -1086,7 +1070,7 @@ def main():
         print(f"  處理 FPS: {info['process_fps']:.1f}")
         print("程式結束")
 
-def process_and_export_data(rec_data, output_dir, mm_per_px, gif_frames):
+def process_and_export_data(rec_data, output_dir, mm_per_px):
     """處理並輸出追蹤資料 - 包含圖表生成"""
     OUT_PREFIX = f"camera_{MODE}"
     
@@ -1143,22 +1127,6 @@ def process_and_export_data(rec_data, output_dir, mm_per_px, gif_frames):
     # 生成圖表
     print("生成圖表...")
     plot_paths = generate_plots(df, output_dir, OUT_PREFIX)
-    
-    # 生成 GIF
-    if HAVE_PIL and len(gif_frames) > 0:
-        gif_path = os.path.join(output_dir, f"{OUT_PREFIX}_tracked.gif")
-        try:
-            gif_frames[0].save(
-                gif_path,
-                save_all=True,
-                append_images=gif_frames[1:],
-                duration=33,  # 約 30 FPS
-                loop=0,
-                optimize=True
-            )
-            print(f"✓ GIF 已生成: {gif_path}")
-        except Exception as e:
-            print(f"✗ GIF 生成失敗: {e}")
     
     print(f"\n✓ 資料已輸出到: {output_dir}")
     print(f"  - CSV: {os.path.basename(csv_path)}")
