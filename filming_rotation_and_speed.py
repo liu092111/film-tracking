@@ -133,6 +133,8 @@ def find_target_and_angle(frame_bgr):
 
     rect = cv2.minAreaRect(cnt)  # (center(x,y), (w,h), angle)
     (cx, cy), (rw, rh), rect_angle = rect
+    box = cv2.boxPoints(rect)    # 4 頂點 (float)
+    box = np.array(box, dtype=np.float32)
 
     # 角度正規化到 [-90, 90)
     if rw >= rh:
@@ -143,7 +145,7 @@ def find_target_and_angle(frame_bgr):
     while angle_deg < -90.0: angle_deg += 180.0
 
     x, y, w, h = cv2.boundingRect(cnt)
-    return (cx, cy, x, y, w, h, angle_deg, cnt)
+    return (cx, cy, x, y, w, h, angle_deg, cnt, box)
 
 def create_output_directory(video_path):
     base_name = os.path.splitext(os.path.basename(video_path))[0]
@@ -203,7 +205,7 @@ def main():
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     rec = []  # frame, t_s, x_px_filt, y_px_filt, x_mm, y_mm, angle_deg_raw, mm_per_px
-    rec_corners = []  # 記錄四個頂點的座標 (frame, t_s, c1_x_mm, c1_y_mm, c2_x_mm, c2_y_mm, c3_x_mm, c3_y_mm, c4_x_mm, c4_y_mm)
+    box_rec = []  # 記錄每一幀的 box (四個頂點) 用於後續繪製
     frame_idx = 0
 
     # 疊字即時線速度（mm/s）
@@ -223,10 +225,10 @@ def main():
         pred = kf.predict()
         meas = find_target_and_angle(frame)
         angle_deg = np.nan
-        corners_mm = [np.nan] * 8  # 4個頂點的 x, y 座標（mm）
+        box = None
 
         if meas is not None:
-            cx, cy, x, y, wbox, hbox, angle_deg, cnt = meas
+            cx, cy, x, y, wbox, hbox, angle_deg, cnt, box = meas
             est = kf.correct(np.array([[cx],[cy]], dtype=np.float32))
             fx, fy = float(est[0,0]), float(est[1,0])
 
@@ -234,14 +236,6 @@ def main():
             cv2.drawContours(frame, [cnt], -1, (0, 0, 255), 4)
             if np.isfinite(fx) and np.isfinite(fy):
                 cv2.circle(frame, (int(round(fx)), int(round(fy))), 6, (0,255,0), -1)
-            
-            # 計算旋轉矩形的四個頂點
-            rect = cv2.minAreaRect(cnt)
-            box_points = cv2.boxPoints(rect)  # 返回4個頂點座標 (x, y)
-            # 將頂點轉換為 mm 單位
-            for i, (px, py) in enumerate(box_points):
-                corners_mm[i*2] = px * mm_per_px
-                corners_mm[i*2 + 1] = py * mm_per_px
         else:
             fx = fy = np.nan
 
@@ -276,8 +270,11 @@ def main():
 
         # 記錄中心點
         rec.append((frame_idx, t_s, fx, fy, fx_mm, fy_mm, angle_deg, mm_per_px))
-        # 記錄四個頂點
-        rec_corners.append([frame_idx, t_s] + corners_mm)
+        # 記錄 box（如果有偵測到）
+        if meas is not None:
+            box_rec.append((frame_idx, t_s, fx, fy, box))
+        else:
+            box_rec.append((frame_idx, t_s, fx, fy, None))
         frame_idx += 1
 
     cap.release()
@@ -286,13 +283,6 @@ def main():
     # ---- 匯總為 DataFrame ----
     df = pd.DataFrame(rec, columns=[
         "frame","t_s","x_px_filt","y_px_filt","x_mm","y_mm","angle_deg_raw","mm_per_px"
-    ])
-    
-    # 四個頂點的 DataFrame
-    df_corners = pd.DataFrame(rec_corners, columns=[
-        "frame","t_s",
-        "c1_x_mm","c1_y_mm","c2_x_mm","c2_y_mm",
-        "c3_x_mm","c3_y_mm","c4_x_mm","c4_y_mm"
     ])
 
     # === 將座標平移，使起點為 (0, 0) ===
@@ -303,11 +293,6 @@ def main():
         x0, y0 = x_abs[valid][0], y_abs[valid][0]
         df["x_mm"] = x_abs - x0
         df["y_mm"] = y_abs - y0
-        
-        # 對四個頂點也進行相同的平移
-        for i in range(1, 5):
-            df_corners[f"c{i}_x_mm"] = df_corners[f"c{i}_x_mm"] - x0
-            df_corners[f"c{i}_y_mm"] = df_corners[f"c{i}_y_mm"] - y0
     else:
         df["x_mm"] = x_abs
         df["y_mm"] = y_abs
@@ -422,65 +407,245 @@ def main():
     plt.close(figW)
     print(f"[輸出] 圖片：{plot_w_path}")
 
-    # C) 五點軌跡圖（4個頂點用虛線 + 中心用實線）
-    figC, ax_five = plt.subplots(1, 1, figsize=(7, 6), constrained_layout=True)
+    # C) 軌跡圖（統一虛線、同個顏色）
+    figC, ax_contour = plt.subplots(1, 1, figsize=(7, 6), constrained_layout=True)
     
-    # 繪製四個頂點的軌跡（虛線、更明顯的顏色）
-    corner_colors = ['cyan', 'magenta', 'lime', 'orange']  # 使用更明顯的顏色
-    corner_labels = ['Corner 1', 'Corner 2', 'Corner 3', 'Corner 4']
+    # 繪製整體路徑
+    ax_contour.plot(x_plot, y_plot, lw=2, color='blue', label="Trajectory", alpha=0.7)
     
-    for i in range(1, 5):
-        x_corner = df_corners[f"c{i}_x_mm"].to_numpy()
-        y_corner = df_corners[f"c{i}_y_mm"].to_numpy()
-        ax_five.plot(x_corner, y_corner, linestyle='--', linewidth=2.0,  # 增加線寬
-                    color=corner_colors[i-1], alpha=0.7, label=corner_labels[i-1])
+    # 找出有效的幀（有box數據的）
+    valid_boxes = [(idx, ts, fx_val, fy_val, box) for idx, ts, fx_val, fy_val, box in box_rec 
+                   if box is not None and np.isfinite(fx_val) and np.isfinite(fy_val)]
     
-    # 繪製中心點軌跡（實線，較粗）
-    ax_five.plot(x_plot, y_plot, lw=3.0, color='blue', label="Center", zorder=5)
+    if len(valid_boxes) >= 8:
+        # 選擇8個等間隔的時間點，包括起點和終點
+        n_segments = 8
+        indices = np.linspace(0, len(valid_boxes) - 1, n_segments, dtype=int)
+        
+        # 使用統一顏色虛線繪製輪廓
+        for i, idx in enumerate(indices):
+            frame_idx_val, t_s_val, fx_px_val, fy_px_val, box = valid_boxes[idx]
+            
+            # 找出對應的 mm 座標（相對起點）
+            df_row = df[df['frame'] == frame_idx_val]
+            if len(df_row) > 0:
+                # 將box的四個頂點轉換為相對mm座標
+                box_mm = []
+                for vertex in box:
+                    vx_px, vy_px = vertex[0], vertex[1]
+                    vx_mm = vx_px * mm_per_px - x0
+                    vy_mm = vy_px * mm_per_px - y0
+                    box_mm.append([vx_mm, vy_mm])
+                
+                box_mm = np.array(box_mm)
+                
+                # 繪製輪廓（統一淺藍色虛線）
+                color = (0.5, 0.7, 1.0)  # 淺藍色
+                linestyle = '--'
+                linewidth = 1.5
+                alpha = 0.7
+                
+                box_closed = np.vstack([box_mm, box_mm[0:1]])
+                ax_contour.plot(box_closed[:, 0], box_closed[:, 1], 
+                              linestyle=linestyle, linewidth=linewidth, 
+                              color=color, alpha=alpha)
     
     # 標記起點和終點
     valid_pos = np.vstack([x_plot, y_plot]).T
     valid_pos = valid_pos[~np.isnan(valid_pos).any(axis=1)]
     if len(valid_pos) > 0:
-        x_start, y_start = valid_pos[0,0], valid_pos[0,1]
-        x_end,   y_end   = valid_pos[-1,0], valid_pos[-1,1]
-        ax_five.scatter([x_start], [y_start], s=120, c="green", marker="o", 
-                       label="Start", zorder=10, edgecolors='black', linewidths=2)
-        ax_five.scatter([x_end],   [y_end],   s=120, c="red",   marker="o", 
-                       label="End",   zorder=10, edgecolors='black', linewidths=2)
+        x_start, y_start = valid_pos[0, 0], valid_pos[0, 1]
+        x_end, y_end = valid_pos[-1, 0], valid_pos[-1, 1]
+        ax_contour.scatter([x_start], [y_start], s=100, c="green", 
+                          marker="o", label="Start", zorder=5)
+        ax_contour.scatter([x_end], [y_end], s=100, c="red", 
+                          marker="o", label="End", zorder=5)
         
-        # 自動視窗 - 考慮所有點（中心+頂點）
-        all_x = [x_plot]
-        all_y = [y_plot]
-        for i in range(1, 5):
-            all_x.append(df_corners[f"c{i}_x_mm"].to_numpy())
-            all_y.append(df_corners[f"c{i}_y_mm"].to_numpy())
-        
-        all_x = np.concatenate(all_x)
-        all_y = np.concatenate(all_y)
-        
-        xmin, xmax = np.nanmin(all_x), np.nanmax(all_x)
-        ymin, ymax = np.nanmin(all_y), np.nanmax(all_y)
+        # 設置座標軸範圍
+        xmin, xmax = np.nanmin(x_plot), np.nanmax(x_plot)
+        ymin, ymax = np.nanmin(y_plot), np.nanmax(y_plot)
         xc = 0.5 * (xmin + xmax)
         yc = 0.5 * (ymin + ymax)
-        half = 0.5 * max(xmax - xmin, ymax - ymin)
-        half = max(half, 1e-6) * 1.35
-        ax_five.set_xlim(xc - half, xc + half)
-        ax_five.set_ylim(yc - half, yc + half)
+        half_range = 0.5 * max(xmax - xmin, ymax - ymin)
+        half_range = max(half_range, 1e-6) * 1.35
+        ax_contour.set_xlim(xc - half_range, xc + half_range)
+        ax_contour.set_ylim(yc - half_range, yc + half_range)
     
     if INVERT_Y_AXIS:
-        ax_five.invert_yaxis()
-    ax_five.set_aspect("equal", adjustable="box")
-    ax_five.set_xlabel("x (mm)")
-    ax_five.set_ylabel("y (mm)")
-    ax_five.set_title("5-Point Trajectory (4 Corners + Center)")
-    ax_five.grid(True, linestyle="--", alpha=0.4)
-    ax_five.legend(loc="best", fontsize=8)
+        ax_contour.invert_yaxis()
     
-    plot_five_path = os.path.join(output_dir, f"{OUT_PREFIX}_five_points_trajectory.png")
-    figC.savefig(plot_five_path, dpi=220)
+    ax_contour.set_aspect("equal", adjustable="box")
+    ax_contour.set_xlabel("x (mm)")
+    ax_contour.set_ylabel("y (mm)")
+    ax_contour.set_title("Center Trajectory with 8 Time Points")
+    ax_contour.grid(True, linestyle="--", alpha=0.4)
+    ax_contour.legend(loc="best")
+    
+    plot_contour_path = os.path.join(output_dir, f"{OUT_PREFIX}_trajectory_center_only.png")
+    figC.savefig(plot_contour_path, dpi=220)
     plt.close(figC)
-    print(f"[輸出] 圖片：{plot_five_path}")
+    print(f"[輸出] 圖片（八等分輪廓）：{plot_contour_path}")
+
+    # ====== 新增：從原始影片提取 8 個時間點的畫面並合併（帶中心路徑和累積輪廓）======
+    if len(valid_boxes) >= 8:
+        print(f"\n[資訊] 正在提取 8 個時間點的影片畫面...")
+        
+        # 重新開啟原始影片
+        cap_composite = cv2.VideoCapture(VIDEO_PATH)
+        
+        # 使用與輪廓圖相同的 8 個時間點
+        n_segments = 8
+        indices = np.linspace(0, len(valid_boxes) - 1, n_segments, dtype=int)
+        
+        # 提取對應的 frame 編號和時間
+        snapshot_frames = []
+        snapshot_times = []
+        for idx in indices:
+            frame_idx_val, t_s_val, _, _, _ = valid_boxes[idx]
+            snapshot_frames.append(frame_idx_val)
+            # 計算相對時間（從第一個有效幀開始為 0s）
+            first_valid_time = valid_boxes[0][1]
+            relative_time = t_s_val - first_valid_time
+            snapshot_times.append(relative_time)
+        
+        # 用表格逐幀疊字
+        row_map = {int(r.frame): i for i, r in df.iterrows()}
+        
+        # 提取畫面並繪製中心路徑和累積輪廓
+        extracted_frames = []
+        
+        for snap_idx, frame_num in enumerate(snapshot_frames):
+            cap_composite.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ok, frame = cap_composite.read()
+            if not ok:
+                continue
+            
+            # 繪製該時間點之前的所有輪廓（淺藍色虛線）
+            light_blue = (255, 200, 150)  # BGR 淺藍色
+            for i in range(snap_idx + 1):  # 包含當前時間點
+                box_idx = indices[i]
+                _, _, _, _, box = valid_boxes[box_idx]
+                if box is not None:
+                    box_int = np.int32(box)
+                    # 繪製虛線輪廓
+                    for j in range(4):
+                        pt1 = tuple(box_int[j])
+                        pt2 = tuple(box_int[(j + 1) % 4])
+                        # 簡單虛線實現
+                        dist = np.linalg.norm(np.array(pt1) - np.array(pt2))
+                        num_segments = int(dist / 10)
+                        if num_segments > 0:
+                            for k in range(num_segments):
+                                if k % 2 == 0:  # 只畫偶數段
+                                    start = (
+                                        int(pt1[0] + (pt2[0] - pt1[0]) * k / num_segments),
+                                        int(pt1[1] + (pt2[1] - pt1[1]) * k / num_segments)
+                                    )
+                                    end = (
+                                        int(pt1[0] + (pt2[0] - pt1[0]) * (k + 1) / num_segments),
+                                        int(pt1[1] + (pt2[1] - pt1[1]) * (k + 1) / num_segments)
+                                    )
+                                    cv2.line(frame, start, end, light_blue, 2)
+            
+            # 繪製完整的中心路徑（從起點到當前時間點的所有位置）
+            center_color_composite = (255, 0, 0)  # BGR 藍色
+            current_frame_num = snapshot_frames[snap_idx]
+            
+            # 收集所有從起點到當前幀的位置
+            path_points = []
+            for idx in range(len(df)):
+                if df.iloc[idx]['frame'] <= current_frame_num:
+                    fx_val = df.iloc[idx]['x_px_filt']
+                    fy_val = df.iloc[idx]['y_px_filt']
+                    if np.isfinite(fx_val) and np.isfinite(fy_val):
+                        path_points.append((int(round(fx_val)), int(round(fy_val))))
+            
+            # 繪製完整路徑（連續的線）
+            if len(path_points) > 1:
+                for i in range(1, len(path_points)):
+                    cv2.line(frame, path_points[i-1], path_points[i], 
+                           center_color_composite, 2)
+            
+            # 在8個snapshot點上畫圓標記（純藍色，無外框）
+            for i in range(snap_idx + 1):
+                df_idx = snapshot_frames[i]
+                if df_idx in row_map:
+                    fx_px = df[df['frame'] == df_idx]['x_px_filt'].values
+                    fy_px = df[df['frame'] == df_idx]['y_px_filt'].values
+                    if len(fx_px) > 0 and len(fy_px) > 0:
+                        if np.isfinite(fx_px[0]) and np.isfinite(fy_px[0]):
+                            cx_i = int(round(fx_px[0]))
+                            cy_i = int(round(fy_px[0]))
+                            cv2.circle(frame, (cx_i, cy_i), 7, center_color_composite, -1)
+            
+            # 在右下角添加時間標註
+            height, width = frame.shape[:2]
+            time_text = f"t={snapshot_times[snap_idx]:.2f}s"
+            
+            # 設定文字參數
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 1.0
+            font_thickness = 2
+            text_color = (0, 0, 255)  # 紅色 (BGR)
+            
+            # 獲取文字大小
+            (text_width, text_height), baseline = cv2.getTextSize(
+                time_text, font, font_scale, font_thickness
+            )
+            
+            # 計算文字位置（右下角，留一些邊距）
+            margin = 10
+            text_x = width - text_width - margin
+            text_y = height - margin
+            
+            # 添加文字背景（黑色半透明矩形）
+            overlay = frame.copy()
+            cv2.rectangle(
+                overlay,
+                (text_x - 5, text_y - text_height - 5),
+                (text_x + text_width + 5, text_y + baseline + 5),
+                (0, 0, 0),
+                -1
+            )
+            cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+            
+            # 添加文字
+            cv2.putText(
+                frame,
+                time_text,
+                (text_x, text_y),
+                font,
+                font_scale,
+                text_color,
+                font_thickness,
+                cv2.LINE_AA
+            )
+            
+            extracted_frames.append(frame)
+        
+        cap_composite.release()
+        
+        # 將 8 張圖水平拼接
+        if len(extracted_frames) == 8:
+            # 調整每張圖的大小（可選：縮小以便組圖不會太大）
+            target_height = 300  # 可以調整這個值
+            resized_frames = []
+            for frame in extracted_frames:
+                h, w = frame.shape[:2]
+                scale = target_height / h
+                new_width = int(w * scale)
+                resized = cv2.resize(frame, (new_width, target_height))
+                resized_frames.append(resized)
+            
+            # 水平拼接
+            combined_frame = np.hstack(resized_frames)
+            
+            # 保存組圖
+            composite_path = os.path.join(output_dir, f"{OUT_PREFIX}_8_timepoints_composite.png")
+            cv2.imwrite(composite_path, combined_frame)
+            print(f"[輸出] 8 個時間點組圖：{composite_path}")
+        else:
+            print(f"[警告] 只提取到 {len(extracted_frames)} 個畫面，無法生成組圖")
 
     print(f"\n所有輸出檔案已整理至資料夾：{output_dir}")
 

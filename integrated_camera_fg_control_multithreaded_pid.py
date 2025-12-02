@@ -87,7 +87,7 @@ STATIC_SPEED_THRESHOLD = 1.0
 # ========== PID 控制參數 ==========
 # Straight mode PID (控制 orientation → 0°)
 PID_KP_STRAIGHT = 0.02  # 比例增益
-PID_KI_STRAIGHT = 0.001  # 積分增益
+PID_KI_STRAIGHT = 0.0  # 積分增益
 PID_KD_STRAIGHT = 0.01  # 微分增益
 
 # Rotation mode PID (控制累積角度 → 90°)
@@ -437,7 +437,7 @@ class FunctionGeneratorController:
         
         return sampling_rates
     
-    def setup_continuous_output(self, initial_mode=1):
+    def setup_continuous_output(self):
         """設定連續輸出模式"""
         if not self.connected:
             return False
@@ -445,7 +445,7 @@ class FunctionGeneratorController:
         try:
             print("設定連續輸出模式...")
             
-            base_mode = self.sampling_rates[initial_mode]
+            base_mode = self.sampling_rates[1]
             
             self.inst.write('SOUR1:FUNC ARB')
             self.inst.write('SOUR2:FUNC ARB')
@@ -478,7 +478,6 @@ class FunctionGeneratorController:
             self.inst.write('*WAI')
             
             self.continuous_output_setup = True
-            self.current_mode = initial_mode
             print("✓ 連續輸出模式已設定完成")
             return True
             
@@ -513,16 +512,16 @@ class FunctionGeneratorController:
             return False
         
         if not self.continuous_output_setup:
-            if not self.setup_continuous_output(mode_num):
+            if not self.setup_continuous_output():
                 return False
         
         start_time = time.time()
         
         mode_configs = {
-            1: {'ch1_pol': 'NORM', 'ch2_pol': 'INV', 'wave_type': '25k'},
-            2: {'ch1_pol': 'NORM', 'ch2_pol': 'INV', 'wave_type': '47k'},
-            3: {'ch1_pol': 'INV', 'ch2_pol': 'NORM', 'wave_type': '25k'},
-            4: {'ch1_pol': 'INV', 'ch2_pol': 'NORM', 'wave_type': '47k'}
+            1: {'ch1_volt': 1.2, 'ch2_volt': 1.2, 'ch1_pol': 'NORM', 'ch2_pol': 'INV', 'wave_type': '25k', 'desc': '25k Hz, CH1=NORM, CH2=INV'},
+            2: {'ch1_volt': 1.2, 'ch2_volt': 1.2, 'ch1_pol': 'NORM', 'ch2_pol': 'INV', 'wave_type': '47k', 'desc': '47k Hz, CH1=NORM, CH2=INV'},
+            3: {'ch1_volt': 1.2, 'ch2_volt': 1.2, 'ch1_pol': 'INV', 'ch2_pol': 'NORM', 'wave_type': '25k', 'desc': '25k Hz, CH1=INV, CH2=NORM'},
+            4: {'ch1_volt': 1.2, 'ch2_volt': 1.2, 'ch1_pol': 'INV', 'ch2_pol': 'NORM', 'wave_type': '47k', 'desc': '47k Hz, CH1=INV, CH2=NORM'}
         }
         
         config = mode_configs[mode_num]
@@ -531,7 +530,7 @@ class FunctionGeneratorController:
         try:
             need_waveform_switch = False
             if self.current_mode is None:
-                need_waveform_switch = True
+                need_waveform_switch = config['wave_type'] != '25k'
             else:
                 current_config = mode_configs[self.current_mode]
                 need_waveform_switch = current_config['wave_type'] != config['wave_type']
@@ -565,14 +564,19 @@ class FunctionGeneratorController:
                 self.inst.write('OUTP1 ON; OUTP2 ON')
                 self.inst.write('*WAI')
             
-            # 設定電壓（使用當前 PID 輸出或基礎電壓）
-            self.inst.write(f'SOUR1:VOLT {self.current_voltage:.3f}; SOUR2:VOLT {self.current_voltage:.3f}')
+            # 設定電壓（如果 PID 啟用，使用當前電壓；否則使用配置的電壓）
+            if ENABLE_PID and self.current_voltage != config['ch1_volt']:
+                # PID 已經在控制電壓，保持當前值
+                pass
+            else:
+                self.inst.write(f'SOUR1:VOLT {config["ch1_volt"]}; SOUR2:VOLT {config["ch2_volt"]}')
+                self.current_voltage = config['ch1_volt']
             self.inst.write('*WAI')
             
             switch_time = (time.time() - start_time) * 1000
             self.current_mode = mode_num
             
-            print(f"FG Mode {mode_num} | {switch_time:.1f}ms | Voltage: {self.current_voltage:.3f}V")
+            print(f"FG Mode {mode_num} | {switch_time:.1f}ms | {config['desc']}")
             return True
             
         except Exception as e:
@@ -584,13 +588,18 @@ class FunctionGeneratorController:
         if not self.connected:
             return
         try:
+            # 先將電壓設為0
             self.inst.write('SOUR1:VOLT 0; SOUR2:VOLT 0')
+            self.inst.write('*WAI')
+            # 關閉輸出通道
+            self.inst.write('OUTP1 OFF; OUTP2 OFF')
             self.inst.write('*WAI')
             self.current_voltage = 0.0
             self.current_mode = None
-            print("函數產生器輸出已關閉 (電壓=0V)")
+            self.continuous_output_setup = False
+            print("✓ 函數產生器輸出已完全關閉")
         except Exception as e:
-            print(f"關閉函數產生器失敗: {e}")
+            print(f"✗ 關閉函數產生器失敗: {e}")
 
 # ========== 輔助函數 ==========
 def unwrap_angles_deg(a_deg):
@@ -993,7 +1002,8 @@ def process_thread(frame_queue, result_queue, running, stats, kf, tracker_state,
             't_s': t_s,
             'pid_voltage': pid_voltage,
             'pid_error': pid_error,
-            'pid_output': pid_output_raw
+            'pid_output': pid_output_raw,
+            'box': box  # 記錄 box 用於後續繪製
         }
         
         try:
@@ -1060,6 +1070,7 @@ def main():
     # 初始化函數產生器
     fg_controller = FunctionGeneratorController()
     fg_connected = fg_controller.connect()
+    selected_mode = None  # 尚未選擇模式
     
     # 初始化攝影機
     print("\n初始化攝影機...")
@@ -1175,7 +1186,7 @@ def main():
                     if 'raw_frame' in data:
                         writer_raw.write(data['raw_frame'])
                     
-                    # 記錄資料 (加入 PID 相關資料)
+                    # 記錄資料 (加入 PID 相關資料和 box)
                     rec_data.append((
                         data['frame_idx'], data['t_s'],
                         data['fx'], data['fy'],
@@ -1184,7 +1195,8 @@ def main():
                         data.get('pid_voltage', PID_VOLTAGE_BASE),
                         data.get('pid_error', 0.0),
                         data.get('pid_output', 0.0),
-                        mm_per_px
+                        mm_per_px,
+                        data.get('box')  # 記錄 box
                     ))
                 
             except queue.Empty:
@@ -1197,27 +1209,35 @@ def main():
                 print("\n停止中...")
                 running[0] = False
                 break
-            elif key == 32:
+            elif key == 32:  # Space
                 if not tracker_state['recording']:
                     tracker_state['recording'] = True
                     if pid_controller:
                         pid_controller.reset()
                     print("開始錄製...")
+                    if fg_connected:
+                        print("  請按 [1-4] 選擇函數產生器模式以開始 PID 控制")
                 else:
                     tracker_state['recording'] = False
                     print("停止錄製...")
+                    # 先關閉函數產生器，等待完成
                     if fg_connected:
                         fg_controller.turn_off()
+                        time.sleep(0.2)  # 等待 FG 完全關閉
                     break
             elif key == ord('h'):
                 show_help()
             elif key == ord('0'):
                 if fg_connected:
                     fg_controller.turn_off()
+                    selected_mode = None
             elif key in [ord('1'), ord('2'), ord('3'), ord('4')]:
                 if fg_connected:
                     mode_num = int(chr(key))
-                    fg_controller.switch_mode
+                    success = fg_controller.switch_mode(mode_num)
+                    if success:
+                        selected_mode = mode_num
+                        print(f"✓ 已選擇 Mode {mode_num}，現在可以按 [Space] 開始錄製")
                 else:
                     print("函數產生器未連接")
     
@@ -1258,11 +1278,21 @@ def main():
         print("程式結束")
 
 def process_and_export_data(rec_data, output_dir, mm_per_px):
-    """處理並輸出追蹤資料 - 包含圖表生成"""
     OUT_PREFIX = f"camera_{MODE}"
     
+    # 分離 box 資料（PID 版本有13個欄位）
+    box_rec = []
+    data_without_box = []
+    for row in rec_data:
+        if len(row) >= 13:  # 包含 box
+            frame_idx, t_s, fx, fy, fx_mm_abs, fy_mm_abs, angle, cumulative_angle, pid_v, pid_e, pid_o, mmpx, box = row
+            box_rec.append((frame_idx, t_s, fx, fy, box))
+            data_without_box.append((frame_idx, t_s, fx, fy, fx_mm_abs, fy_mm_abs, angle, cumulative_angle, pid_v, pid_e, pid_o, mmpx))
+        else:
+            data_without_box.append(row)
+    
     # 整理資料
-    df = pd.DataFrame(rec_data, columns=[
+    df = pd.DataFrame(data_without_box, columns=[
         "frame","t_s","x_px_filt","y_px_filt","x_mm_abs","y_mm_abs","angle_deg_raw","cumulative_angle",
         "pid_voltage","pid_error","pid_output","mm_per_px"
     ])
@@ -1315,6 +1345,17 @@ def process_and_export_data(rec_data, output_dir, mm_per_px):
     # 生成圖表
     print("生成圖表...")
     plot_paths = generate_plots(df, output_dir, OUT_PREFIX)
+
+    # 生成新的軌跡圖和組圖
+    if len(box_rec) >= 8 and valid.any():
+        print("生成軌跡輪廓圖和8時間點組圖...")
+        try:
+            additional_plots = generate_trajectory_and_composite(
+                df, box_rec, output_dir, OUT_PREFIX, mm_per_px, x0, y0
+            )
+            plot_paths.update(additional_plots)
+        except Exception as e:
+            print(f"  警告：生成額外圖表時發生錯誤: {e}")
     
     print(f"\n✓ 資料已輸出到: {output_dir}")
     print(f"  - CSV: {os.path.basename(csv_path)}")
@@ -1438,6 +1479,256 @@ def generate_plots(df, output_dir, OUT_PREFIX):
         figW.savefig(plot_w_path, dpi=220)
         plt.close(figW)
         plot_paths['angular_speed'] = plot_w_path
+    
+    return plot_paths
+
+def generate_trajectory_and_composite(df, box_rec, output_dir, OUT_PREFIX, mm_per_px, x0, y0):
+    """生成軌跡輪廓圖和8時間點組圖"""
+    plot_paths = {}
+    
+    # 從 box_rec 中提取有效的 boxes
+    valid_boxes = [(idx, ts, fx, fy, box) for idx, ts, fx, fy, box in box_rec 
+                   if box is not None and np.isfinite(fx) and np.isfinite(fy)]
+    
+    if len(valid_boxes) < 8:
+        print(f"  警告：只有 {len(valid_boxes)} 個有效框，需要至少 8 個")
+        return plot_paths
+    
+    # === 1. 生成軌跡輪廓圖 ===
+    figC, ax_contour = plt.subplots(1, 1, figsize=(7, 6), constrained_layout=True)
+    
+    # 繪製整體路徑
+    x_plot = df["x_mm"].to_numpy()
+    y_plot = df["y_mm"].to_numpy()
+    ax_contour.plot(x_plot, y_plot, lw=2, color='blue', label="Trajectory", alpha=0.7)
+    
+    # 選擇8個等間隔的時間點
+    n_segments = 8
+    indices = np.linspace(0, len(valid_boxes) - 1, n_segments, dtype=int)
+    
+    # 使用統一顏色虛線繪製輪廓
+    for i, idx in enumerate(indices):
+        frame_idx_val, t_s_val, fx_px_val, fy_px_val, box = valid_boxes[idx]
+        
+        # 將box的四個頂點轉換為相對mm座標
+        box_mm = []
+        for vertex in box:
+            vx_px, vy_px = vertex[0], vertex[1]
+            vx_mm = vx_px * mm_per_px - x0
+            vy_mm = -(vy_px * mm_per_px - y0)  # 修正Y座標
+            box_mm.append([vx_mm, vy_mm])
+        
+        box_mm = np.array(box_mm)
+        
+        # 繪製輪廓（統一淺藍色虛線）
+        color = (0.5, 0.7, 1.0)  # 淺藍色
+        linestyle = '--'
+        linewidth = 1.5
+        alpha = 0.7
+        
+        box_closed = np.vstack([box_mm, box_mm[0:1]])
+        ax_contour.plot(box_closed[:, 0], box_closed[:, 1], 
+                      linestyle=linestyle, linewidth=linewidth, 
+                      color=color, alpha=alpha)
+    
+    # 標記起點和終點
+    valid_pos = np.vstack([x_plot, y_plot]).T
+    valid_pos = valid_pos[~np.isnan(valid_pos).any(axis=1)]
+    if len(valid_pos) > 0:
+        x_start, y_start = valid_pos[0, 0], valid_pos[0, 1]
+        x_end, y_end = valid_pos[-1, 0], valid_pos[-1, 1]
+        ax_contour.scatter([x_start], [y_start], s=100, c="green", 
+                          marker="o", label="Start", zorder=5)
+        ax_contour.scatter([x_end], [y_end], s=100, c="red", 
+                          marker="o", label="End", zorder=5)
+        
+        # 設置座標軸範圍
+        xmin, xmax = np.nanmin(x_plot), np.nanmax(x_plot)
+        ymin, ymax = np.nanmin(y_plot), np.nanmax(y_plot)
+        xc = 0.5 * (xmin + xmax)
+        yc = 0.5 * (ymin + ymax)
+        half_range = 0.5 * max(xmax - xmin, ymax - ymin)
+        half_range = max(half_range, 1e-6) * PLOT_RANGE_SCALE
+        ax_contour.set_xlim(xc - half_range, xc + half_range)
+        ax_contour.set_ylim(yc - half_range, yc + half_range)
+    
+    if INVERT_Y_AXIS:
+        ax_contour.invert_yaxis()
+    
+    ax_contour.set_aspect("equal", adjustable="box")
+    ax_contour.set_xlabel("x (mm)")
+    ax_contour.set_ylabel("y (mm)")
+    ax_contour.set_title("Center Trajectory with 8 Time Points")
+    ax_contour.grid(True, linestyle="--", alpha=0.4)
+    ax_contour.legend(loc="best")
+    
+    plot_contour_path = os.path.join(output_dir, f"{OUT_PREFIX}_trajectory_center_only.png")
+    figC.savefig(plot_contour_path, dpi=220)
+    plt.close(figC)
+    plot_paths['trajectory_contour'] = plot_contour_path
+    
+    # === 2. 生成 8 個時間點組圖（需要原始影片）===
+    # 檢查是否有原始影片
+    raw_video_path = os.path.join(output_dir, f"camera_{MODE}_raw.mp4")
+    if not os.path.exists(raw_video_path):
+        print(f"  警告：找不到原始影片 {raw_video_path}，跳過組圖生成")
+        return plot_paths
+    
+    try:
+        # 重新開啟原始影片
+        cap_composite = cv2.VideoCapture(raw_video_path)
+        
+        # 提取對應的 frame 編號和時間
+        snapshot_frames = []
+        snapshot_times = []
+        for idx in indices:
+            frame_idx_val, t_s_val, _, _, _ = valid_boxes[idx]
+            snapshot_frames.append(frame_idx_val)
+            # 計算相對時間（從第一個有效幀開始為 0s）
+            first_valid_time = valid_boxes[0][1]
+            relative_time = t_s_val - first_valid_time
+            snapshot_times.append(relative_time)
+        
+        # 建立 frame 到 df row 的映射
+        row_map = {int(r['frame']): i for i, r in df.iterrows()}
+        
+        # 提取畫面並繪製中心路徑和累積輪廓
+        extracted_frames = []
+        
+        for snap_idx, frame_num in enumerate(snapshot_frames):
+            cap_composite.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ok, frame = cap_composite.read()
+            if not ok:
+                continue
+            
+            # 繪製該時間點之前的所有輪廓（淺藍色虛線）
+            light_blue = (255, 200, 150)  # BGR 淺藍色
+            for i in range(snap_idx + 1):  # 包含當前時間點
+                box_idx = indices[i]
+                _, _, _, _, box = valid_boxes[box_idx]
+                if box is not None:
+                    box_int = np.int32(box)
+                    # 繪製虛線輪廓
+                    for j in range(4):
+                        pt1 = tuple(box_int[j])
+                        pt2 = tuple(box_int[(j + 1) % 4])
+                        # 簡單虛線實現
+                        dist = np.linalg.norm(np.array(pt1) - np.array(pt2))
+                        num_segments = int(dist / 10)
+                        if num_segments > 0:
+                            for k in range(num_segments):
+                                if k % 2 == 0:  # 只畫偶數段
+                                    start = (
+                                        int(pt1[0] + (pt2[0] - pt1[0]) * k / num_segments),
+                                        int(pt1[1] + (pt2[1] - pt1[1]) * k / num_segments)
+                                    )
+                                    end = (
+                                        int(pt1[0] + (pt2[0] - pt1[0]) * (k + 1) / num_segments),
+                                        int(pt1[1] + (pt2[1] - pt1[1]) * (k + 1) / num_segments)
+                                    )
+                                    cv2.line(frame, start, end, light_blue, 2)
+            
+            # 繪製完整的中心路徑（從起點到當前時間點的所有位置）
+            center_color_composite = (255, 0, 0)  # BGR 藍色
+            current_frame_num = snapshot_frames[snap_idx]
+            
+            # 收集所有從起點到當前幀的位置
+            path_points = []
+            for idx in range(len(df)):
+                if df.iloc[idx]['frame'] <= current_frame_num:
+                    fx_val = df.iloc[idx]['x_px_filt']
+                    fy_val = df.iloc[idx]['y_px_filt']
+                    if np.isfinite(fx_val) and np.isfinite(fy_val):
+                        path_points.append((int(round(fx_val)), int(round(fy_val))))
+            
+            # 繪製完整路徑（連續的線）
+            if len(path_points) > 1:
+                for i in range(1, len(path_points)):
+                    cv2.line(frame, path_points[i-1], path_points[i], 
+                           center_color_composite, 2)
+            
+            # 在8個snapshot點上畫圓標記（純藍色）
+            for i in range(snap_idx + 1):
+                df_idx = snapshot_frames[i]
+                if df_idx in row_map:
+                    fx_px = df.iloc[row_map[df_idx]]['x_px_filt']
+                    fy_px = df.iloc[row_map[df_idx]]['y_px_filt']
+                    if np.isfinite(fx_px) and np.isfinite(fy_px):
+                        cx_i = int(round(fx_px))
+                        cy_i = int(round(fy_px))
+                        cv2.circle(frame, (cx_i, cy_i), 7, center_color_composite, -1)
+            
+            # 在右下角添加時間標註
+            height, width = frame.shape[:2]
+            time_text = f"t={snapshot_times[snap_idx]:.2f}s"
+            
+            # 設定文字參數
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 1.0
+            font_thickness = 2
+            text_color = (0, 0, 255)  # 紅色 (BGR)
+            
+            # 獲取文字大小
+            (text_width, text_height), baseline = cv2.getTextSize(
+                time_text, font, font_scale, font_thickness
+            )
+            
+            # 計算文字位置（右下角，留一些邊距）
+            margin = 10
+            text_x = width - text_width - margin
+            text_y = height - margin
+            
+            # 添加文字背景（黑色半透明矩形）
+            overlay = frame.copy()
+            cv2.rectangle(
+                overlay,
+                (text_x - 5, text_y - text_height - 5),
+                (text_x + text_width + 5, text_y + baseline + 5),
+                (0, 0, 0),
+                -1
+            )
+            cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+            
+            # 添加文字
+            cv2.putText(
+                frame,
+                time_text,
+                (text_x, text_y),
+                font,
+                font_scale,
+                text_color,
+                font_thickness,
+                cv2.LINE_AA
+            )
+            
+            extracted_frames.append(frame)
+        
+        cap_composite.release()
+        
+        # 將 8 張圖水平拼接
+        if len(extracted_frames) == 8:
+            # 調整每張圖的大小
+            target_height = 300
+            resized_frames = []
+            for frame in extracted_frames:
+                h, w = frame.shape[:2]
+                scale = target_height / h
+                new_width = int(w * scale)
+                resized = cv2.resize(frame, (new_width, target_height))
+                resized_frames.append(resized)
+            
+            # 水平拼接
+            combined_frame = np.hstack(resized_frames)
+            
+            # 保存組圖
+            composite_path = os.path.join(output_dir, f"{OUT_PREFIX}_8_timepoints_composite.png")
+            cv2.imwrite(composite_path, combined_frame)
+            plot_paths['composite'] = composite_path
+        else:
+            print(f"  警告：只提取到 {len(extracted_frames)} 個畫面")
+    
+    except Exception as e:
+        print(f"  警告：生成組圖時發生錯誤: {e}")
     
     return plot_paths
 
