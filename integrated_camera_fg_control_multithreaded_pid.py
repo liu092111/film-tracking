@@ -1164,7 +1164,7 @@ def main():
                         run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
                         # 在資料夾名稱中加入 PID 參數
                         pid_str = f"_P={tracker_state['pid_params']['kp']}_I={tracker_state['pid_params']['ki']}_D={tracker_state['pid_params']['kd']}"
-                        output_dir = f"{run_tag}_{MODE}_integrated_mt_pid{pid_str}"
+                        output_dir = f"{run_tag}_{MODE}_pid{pid_str}"
                         os.makedirs(output_dir, exist_ok=True)
                         out_path = os.path.join(output_dir, f"camera_{MODE}_tracked.mp4")
                         out_path_raw = os.path.join(output_dir, f"camera_{MODE}_raw.mp4")

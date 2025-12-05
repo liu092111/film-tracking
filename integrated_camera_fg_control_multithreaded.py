@@ -975,13 +975,10 @@ def main():
                         out_path_raw = os.path.join(output_dir, f"camera_{MODE}_raw.mp4")
                         
                         # 使用實際測量的 FPS（取讀取和處理 FPS 的較小值）
-                        info = stats.get_info()
-                        actual_fps = min(info['capture_fps'], info['process_fps'])
-                        if actual_fps < 10:  # 如果太低，使用預設值
-                            actual_fps = 60.0
-                        
-                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                        # 注意旋轉後的尺寸
+                        out_path = os.path.join(output_dir, f"camera_{MODE}_tracked.avi")
+                        out_path_raw = os.path.join(output_dir, f"camera_{MODE}_raw.avi")
+
+                        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
                         writer = cv2.VideoWriter(out_path, fourcc, actual_fps, (CAM_HEIGHT, CAM_WIDTH))
                         writer_raw = cv2.VideoWriter(out_path_raw, fourcc, actual_fps, (CAM_HEIGHT, CAM_WIDTH))
                         tracker_state['actual_fps'] = actual_fps  # 儲存用於 GIF
