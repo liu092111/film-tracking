@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 
 # ========= 使用者設定 =========
 GRID_SPACING_MM = 5.0
-VIDEO_PATH = "IMG_7129.mov"            # ← 換成你的影片
+VIDEO_PATH = "film/IMG_7129.mov"            # ← 換成你的影片
 OUT_PREFIX = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
 SPEED_THRESH_ACTIVE = 0.1  # mm/s，低於此速度視為靜止
 
@@ -508,17 +508,8 @@ def main():
                 cv2.putText(frame, f"Speed: {inst_speed:.2f} mm/s",
                             (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
 
-        # === 畫歷史路徑 ===
-        # 中心：實線
-        if len(center_path) > 1:
-            for i in range(1, len(center_path)):
-                cv2.line(frame, center_path[i-1], center_path[i], center_color, 2)
-
-        # 四頂點：虛線
-        draw_dashed_polyline(frame, v0_path, light_color, thickness=1, dash_len=8, gap_len=5)
-        draw_dashed_polyline(frame, v1_path, light_color, thickness=1, dash_len=8, gap_len=5)
-        draw_dashed_polyline(frame, v2_path, light_color, thickness=1, dash_len=8, gap_len=5)
-        draw_dashed_polyline(frame, v3_path, light_color, thickness=1, dash_len=8, gap_len=5)
+        # === 畫歷史路徑（已移除）===
+        # 注意：已移除中心點路徑和四頂點路徑的繪製功能
 
         writer.write(frame)
         fidx += 1

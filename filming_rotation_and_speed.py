@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 
 # ========= 使用者設定 =========
 GRID_SPACING_MM = 5.0
-VIDEO_PATH = "IMG_7110.mov"            # ← 換成你的影片路徑
+VIDEO_PATH = "film/load carrying rotate.mp4"            # ← 換成你的影片路徑
 OUT_PREFIX = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
 
 # 顏色遮罩（黃＋白）
@@ -86,21 +86,97 @@ def estimate_mm_per_px_single_frame(frame):
 
     return (GRID_SPACING_MM / px_per_cell) if (px_per_cell and px_per_cell > 0) else None
 
-def unwrap_angles_deg(angles_deg):
+def unwrap_angles_deg(angles_deg, max_angular_vel_dps=300.0, fps=30.0):
+    """
+    手動展開角度序列，支援多圈連續旋轉（超過 360°）。
+    
+    原理：
+    - cv2.minAreaRect 回傳的角度範圍是 [-90°, 90°)，週期為 180°
+    - 當相鄰幀角度差超過 90° 時，代表發生了跳變
+    - 透過將差值正規化到 [-90, 90) 範圍來自動修正跳變
+    - 累積差值到前一個展開值
+    
+    參數：
+    - angles_deg: 原始角度序列 (範圍 [-90, 90))
+    - max_angular_vel_dps: 最大合理角速度 (deg/s)，用於異常檢測（備用）
+    - fps: 幀率（備用）
+    """
     if len(angles_deg) == 0:
         return angles_deg
-    rad = np.deg2rad(angles_deg)
-    rad_unwrap = np.unwrap(rad)
-    return np.rad2deg(rad_unwrap)
+    
+    angles_deg = np.asarray(angles_deg, dtype=float)
+    unwrapped = np.zeros_like(angles_deg)
+    
+    # 找第一個有效值作為起點
+    first_valid_idx = 0
+    for i in range(len(angles_deg)):
+        if np.isfinite(angles_deg[i]):
+            first_valid_idx = i
+            break
+    
+    unwrapped[first_valid_idx] = angles_deg[first_valid_idx]
+    
+    # 向前填充 NaN（如果有的話）
+    for i in range(first_valid_idx):
+        unwrapped[i] = np.nan
+    
+    # 從第一個有效值開始累積展開
+    last_valid_idx = first_valid_idx
+    last_valid_unwrapped = unwrapped[first_valid_idx]
+    last_valid_raw = angles_deg[first_valid_idx]
+    
+    for i in range(first_valid_idx + 1, len(angles_deg)):
+        if np.isnan(angles_deg[i]):
+            unwrapped[i] = np.nan
+            continue
+        
+        # 計算與上一個有效原始角度的差值
+        delta = angles_deg[i] - last_valid_raw
+        
+        # 將差值正規化到 [-90, 90) 範圍
+        # 這樣可以自動處理 ±90° 邊界的跳變
+        while delta >= 90.0:
+            delta -= 180.0
+        while delta < -90.0:
+            delta += 180.0
+        
+        # 累積到上一個有效展開值
+        unwrapped[i] = last_valid_unwrapped + delta
+        
+        # 更新追蹤變數
+        last_valid_idx = i
+        last_valid_unwrapped = unwrapped[i]
+        last_valid_raw = angles_deg[i]
+    
+    return unwrapped
 
 def moving_average(a, w):
+    """
+    移動平均平滑，正確處理 NaN 值和邊界。
+    """
     if w is None or w <= 1:
         return a
     a = np.asarray(a, dtype=float)
     if len(a) < w:
         return a
-    kernel = np.ones(w) / float(w)
-    return np.convolve(a, kernel, mode='same')
+    
+    # 創建輸出陣列
+    result = np.full_like(a, np.nan, dtype=float)
+    half_w = w // 2
+    
+    for i in range(len(a)):
+        # 定義窗口範圍
+        start = max(0, i - half_w)
+        end = min(len(a), i + half_w + 1)
+        
+        # 提取窗口內的值並排除 NaN
+        window = a[start:end]
+        valid = window[np.isfinite(window)]
+        
+        if len(valid) > 0:
+            result[i] = np.mean(valid)
+    
+    return result
 
 def make_kalman():
     kf = cv2.KalmanFilter(4, 2)
@@ -303,7 +379,8 @@ def main():
     mask_ang  = np.isfinite(angle_raw)
     angle_unwrapped = np.full_like(angle_raw, np.nan, dtype=float)
     if mask_ang.any():
-        angle_unwrapped[mask_ang] = unwrap_angles_deg(angle_raw[mask_ang])
+        # 傳入實際 fps 以正確計算最大允許角速度
+        angle_unwrapped[mask_ang] = unwrap_angles_deg(angle_raw[mask_ang], max_angular_vel_dps=300.0, fps=fps)
         angle_unwrapped = moving_average(angle_unwrapped, SMOOTH_WIN_ANGLE)
     df["angle_deg_unwrapped"] = angle_unwrapped
 
@@ -407,6 +484,37 @@ def main():
     plt.close(figW)
     print(f"[輸出] 圖片：{plot_w_path}")
 
+    # B2) Theta (Angle) vs Time
+    figTheta, ax_theta = plt.subplots(1, 1, figsize=(8, 6), constrained_layout=True)
+    ax_theta.plot(df["t_s"], df["angle_deg_unwrapped"], lw=2, color='blue', label="θ (deg)")
+
+    theta_all = df["angle_deg_unwrapped"].to_numpy()
+    finite_theta = np.isfinite(theta_all)
+    if np.any(finite_theta):
+        # 標記起點和終點的角度
+        t_valid = t_all[finite_theta]
+        theta_valid = theta_all[finite_theta]
+        ax_theta.scatter([t_valid[0]], [theta_valid[0]], s=80, c="green", marker="o", 
+                        label=f"Start: {theta_valid[0]:.2f}°", zorder=5)
+        ax_theta.scatter([t_valid[-1]], [theta_valid[-1]], s=80, c="red", marker="o", 
+                        label=f"End: {theta_valid[-1]:.2f}°", zorder=5)
+        
+        # 計算總旋轉角度
+        total_rotation = theta_valid[-1] - theta_valid[0]
+        ax_theta.set_title(f"Theta (Angle) vs Time (Total rotation: {total_rotation:.2f}°)")
+    else:
+        ax_theta.set_title("Theta (Angle) vs Time")
+
+    ax_theta.set_xlabel("Time (s)")
+    ax_theta.set_ylabel("θ (deg)")
+    ax_theta.grid(True, linestyle="--", alpha=0.4)
+    ax_theta.legend(loc="best")
+
+    plot_theta_path = os.path.join(output_dir, f"{OUT_PREFIX}_theta_vs_time.png")
+    figTheta.savefig(plot_theta_path, dpi=220)
+    plt.close(figTheta)
+    print(f"[輸出] 圖片：{plot_theta_path}")
+
     # C) 軌跡圖（統一虛線、同個顏色）
     figC, ax_contour = plt.subplots(1, 1, figsize=(7, 6), constrained_layout=True)
     
@@ -460,16 +568,41 @@ def main():
                           marker="o", label="Start", zorder=5)
         ax_contour.scatter([x_end], [y_end], s=100, c="red", 
                           marker="o", label="End", zorder=5)
-        
-        # 設置座標軸範圍
-        xmin, xmax = np.nanmin(x_plot), np.nanmax(x_plot)
-        ymin, ymax = np.nanmin(y_plot), np.nanmax(y_plot)
-        xc = 0.5 * (xmin + xmax)
-        yc = 0.5 * (ymin + ymax)
-        half_range = 0.5 * max(xmax - xmin, ymax - ymin)
-        half_range = max(half_range, 1e-6) * 1.35
-        ax_contour.set_xlim(xc - half_range, xc + half_range)
-        ax_contour.set_ylim(yc - half_range, yc + half_range)
+    
+    # 設置座標軸範圍：自動偵測，確保所有數據可見，最小範圍 ±15mm
+    MIN_AXIS_RANGE = 15  # 最小軸範圍（mm）
+    
+    # 計算實際數據範圍（包含軌跡和輪廓box）
+    all_x = [x_plot[~np.isnan(x_plot)]]
+    all_y = [y_plot[~np.isnan(y_plot)]]
+    
+    # 加入box頂點的座標
+    if len(valid_boxes) >= 8:
+        for i, idx in enumerate(indices):
+            frame_idx_val, t_s_val, fx_px_val, fy_px_val, box = valid_boxes[idx]
+            if box is not None:
+                for vertex in box:
+                    vx_mm = vertex[0] * mm_per_px - x0
+                    vy_mm = vertex[1] * mm_per_px - y0
+                    all_x.append([vx_mm])
+                    all_y.append([vy_mm])
+    
+    all_x = np.concatenate(all_x)
+    all_y = np.concatenate(all_y)
+    
+    # 計算範圍
+    data_xmin, data_xmax = np.nanmin(all_x), np.nanmax(all_x)
+    data_ymin, data_ymax = np.nanmin(all_y), np.nanmax(all_y)
+    
+    # 計算中心和半範圍
+    xc = 0.5 * (data_xmin + data_xmax)
+    yc = 0.5 * (data_ymin + data_ymax)
+    half_x = 0.5 * (data_xmax - data_xmin) * 1.2  # 加 20% 邊距
+    half_y = 0.5 * (data_ymax - data_ymin) * 1.2
+    half_range = max(half_x, half_y, MIN_AXIS_RANGE)  # 確保最小為 MIN_AXIS_RANGE
+    
+    ax_contour.set_xlim(xc - half_range, xc + half_range)
+    ax_contour.set_ylim(yc - half_range, yc + half_range)
     
     if INVERT_Y_AXIS:
         ax_contour.invert_yaxis()

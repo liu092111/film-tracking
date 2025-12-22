@@ -462,8 +462,14 @@ class FunctionGeneratorController:
 
 # ========== 輔助函數 ==========
 def unwrap_angles_deg(a_deg):
+    """
+    展開角度序列，避免 ±90° 邊界處的跳躍。
+    由於原始角度範圍是 [-90°, 90°)，周期為 180°，
+    需要使用 period=π 來正確處理角度跳變。
+    """
     if len(a_deg) == 0: return a_deg
-    return np.rad2deg(np.unwrap(np.deg2rad(a_deg)))
+    # 原始角度範圍 [-90, 90)，周期為 180° = π 弧度
+    return np.rad2deg(np.unwrap(np.deg2rad(a_deg), period=np.pi))
 
 def wrap_angles_deg(a_deg):
     return ((a_deg + 90) % 180) - 90
