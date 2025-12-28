@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 
 # ========= 使用者設定 =========
 GRID_SPACING_MM = 5.0
-VIDEO_PATH = "film/IMG_7129.mov"            # ← 換成你的影片
+VIDEO_PATH = "film/1.7V straight.mp4"            # ← 換成你的影片
 OUT_PREFIX = os.path.splitext(os.path.basename(VIDEO_PATH))[0]
 SPEED_THRESH_ACTIVE = 0.1  # mm/s，低於此速度視為靜止
 
@@ -35,7 +35,7 @@ AUTO_GRID_MM_PER_PX = True
 MANUAL_MM_PER_PX    = None
 
 # 位置圖與朝向圖的視覺化選項
-INVERT_Y_AXIS       = True             # 位置圖是否反轉 Y 軸（多數影像座標慣例）
+INVERT_Y_AXIS       = False             # 位置圖是否反轉 Y 軸（多數影像座標慣例）
 ALIGN_TRAJ_TO_Y     = True             # Position 圖自動旋轉，使主要移動方向貼齊 +Y
 ORIENT_PLOT_WRAPPED = True             # Orientation 圖用 wrapped(-90~90)
 ORIENT_YLIM_DEG     = 60               # Orientation 圖 Y 軸 ±限制（None=自動）
