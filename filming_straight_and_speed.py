@@ -160,11 +160,15 @@ def make_kalman(init_x=0.0, init_y=0.0):
     kf.statePost = np.array([[init_x], [init_y], [0.0], [0.0]], dtype=np.float32)
     return kf
 
-def find_target_and_angle(frame_bgr):
+def find_target_and_angle(frame_bgr, prev_angle=None, use_ellipse=True):
     """
     回傳：
       (cx, cy, x, y, w, h, angle_deg, cnt, box)
     其中 box 為 minAreaRect 的四個頂點 (4,2)
+    
+    參數：
+      prev_angle: 前一幀的角度（度），用於連續性校正，避免跳變
+      use_ellipse: 是否使用 fitEllipse 來獲取更穩定的角度（輪廓點數 >= 5 時）
     """
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     mask_y = cv2.inRange(hsv, HSV_YELLOW_LO, HSV_YELLOW_HI)
@@ -186,16 +190,63 @@ def find_target_and_angle(frame_bgr):
     box = cv2.boxPoints(rect)    # 4 頂點 (float)
     box = np.array(box, dtype=np.float32)
 
-    # 角度處理
-    if rw >= rh:
-        angle_deg = rect_angle + 90.0
-    else:
-        angle_deg = rect_angle
-
-    while angle_deg >= 90.0:
-        angle_deg -= 180.0
-    while angle_deg < -90.0:
-        angle_deg += 180.0
+    # === 改進的角度計算 ===
+    angle_deg = None
+    
+    # 方法1：使用 fitEllipse 獲取更穩定的方向（推薦用於旋轉物體）
+    if use_ellipse and len(cnt) >= 5:
+        try:
+            ellipse = cv2.fitEllipse(cnt)
+            (_, (ew, eh), ellipse_angle) = ellipse
+            # ellipse_angle 範圍是 [0, 180)
+            # 將其轉換到 (-90, 90] 範圍
+            if ew >= eh:
+                angle_deg = ellipse_angle - 90.0
+            else:
+                angle_deg = ellipse_angle
+            
+            # 標準化到 (-90, 90]
+            while angle_deg > 90.0:
+                angle_deg -= 180.0
+            while angle_deg <= -90.0:
+                angle_deg += 180.0
+        except cv2.error:
+            angle_deg = None
+    
+    # 方法2：回退到 minAreaRect（如果 fitEllipse 失敗或未啟用）
+    if angle_deg is None:
+        if rw >= rh:
+            angle_deg = rect_angle + 90.0
+        else:
+            angle_deg = rect_angle
+        
+        while angle_deg >= 90.0:
+            angle_deg -= 180.0
+        while angle_deg < -90.0:
+            angle_deg += 180.0
+    
+    # === 連續性校正：選擇最接近前一幀的候選角度 ===
+    # 由於橢圓/矩形沒有頭尾之分，角度有 180° 的歧義
+    # 生成候選角度（原始、+180、-180），選擇與前一幀最接近的
+    if prev_angle is not None and np.isfinite(prev_angle):
+        candidates = [angle_deg, angle_deg + 180.0, angle_deg - 180.0]
+        # 選擇與 prev_angle 差異最小的候選
+        best_candidate = angle_deg
+        min_diff = abs(angle_deg - prev_angle)
+        for cand in candidates:
+            diff = abs(cand - prev_angle)
+            if diff < min_diff:
+                min_diff = diff
+                best_candidate = cand
+        angle_deg = best_candidate
+        
+        # === 異常值過濾：如果變化仍然太大，使用前一幀角度 ===
+        # 對於直走或緩慢旋轉的物體，每幀角度變化不應超過此閾值
+        MAX_ANGLE_CHANGE_PER_FRAME = 15.0  # 度/幀，可根據需要調整
+        final_diff = abs(angle_deg - prev_angle)
+        if final_diff > MAX_ANGLE_CHANGE_PER_FRAME:
+            # 使用前一幀的角度（假設這是異常值）
+            angle_deg = prev_angle
 
     x, y, w, h = cv2.boundingRect(cnt)
     return (cx, cy, x, y, w, h, angle_deg, cnt, box)
@@ -289,6 +340,9 @@ def main():
     last_fy_mm = None
     last_t     = None
     inst_speed = np.nan
+    
+    # 用於角度連續性校正的前一幀角度
+    prev_angle_deg = None
 
     while True:
         ok, frame = cap.read()
@@ -301,7 +355,7 @@ def main():
 
         # Center point Kalman prediction and correction
         pred_center = kf_center.predict()
-        meas = find_target_and_angle(frame)
+        meas = find_target_and_angle(frame, prev_angle=prev_angle_deg)
 
         angle_deg = np.nan
         fx = fy = np.nan
@@ -335,6 +389,10 @@ def main():
             box_rec.append((frame_idx, t_s, fx, fy, meas[8]))  # meas[8] 是 box
         else:
             box_rec.append((frame_idx, t_s, fx, fy, None))
+        
+        # 更新前一幀角度（用於下一幀的連續性校正）
+        if np.isfinite(angle_deg):
+            prev_angle_deg = angle_deg
         
         frame_idx += 1
 
@@ -592,24 +650,51 @@ def main():
     ax_s.grid(True, linestyle="--", alpha=0.4)
     ax_s.legend(loc="best")
 
-    # 右：Orientation
-    if ORIENT_PLOT_WRAPPED:
-        ang_vis_plot = wrap_angles_deg(df["angle_deg_unwrapped"].to_numpy())
+    # 右：Orientation（直接使用 raw 角度計算偏移量，更準確）
+    angle_raw_arr = df["angle_deg_raw"].to_numpy()
+    valid_ang_mask = np.isfinite(angle_raw_arr)
+    
+    if valid_ang_mask.any():
+        # 使用起始角度作為參考，顯示相對偏移量
+        first_angle = float(angle_raw_arr[valid_ang_mask][0])
+        # 直接計算偏移量（對於小角度變化，不需要 unwrap）
+        ang_vis_plot = angle_raw_arr - first_angle
+        
+        # 平滑處理（可選）
+        ang_vis_plot = moving_average(ang_vis_plot, SMOOTH_WIN_ANGLE)
+        
+        # 計算實際平均偏移量
+        valid_offset = np.isfinite(ang_vis_plot)
+        if np.any(valid_offset):
+            actual_avg_offset = float(np.nanmean(ang_vis_plot[valid_offset]))
+        else:
+            actual_avg_offset = float("nan")
     else:
-        ang_vis_plot = df["angle_deg_unwrapped"].to_numpy()
+        ang_vis_plot = angle_raw_arr
+        first_angle = 0.0
+        actual_avg_offset = float("nan")
 
-    if np.isfinite(avg_offset_deg):
-        label_orient = f"Orientation (deg)\nAvg offset: {avg_offset_deg:.2f}°"
+    if np.isfinite(actual_avg_offset):
+        label_orient = f"Orientation offset (deg)\nAvg: {actual_avg_offset:.2f}°"
     else:
-        label_orient = "Orientation (deg)"
+        label_orient = "Orientation offset (deg)"
 
     ax_a.plot(df["t_s"], ang_vis_plot, lw=2, label=label_orient)
     ax_a.set_xlabel("Time (s)")
-    ax_a.set_ylabel("Angle (deg)")
-    ax_a.set_title("Orientation vs Time")
+    ax_a.set_ylabel("Angle offset from start (deg)")
+    ax_a.set_title(f"Orientation vs Time (start: {first_angle:.1f}°)")
+    
+    # 自動設定 Y 軸範圍，基於實際數據
     if ORIENT_YLIM_DEG is not None and np.isfinite(ORIENT_YLIM_DEG):
         ylim = float(ORIENT_YLIM_DEG)
         ax_a.set_ylim(-ylim, +ylim)
+    else:
+        # 根據實際偏移量自動設定範圍
+        valid_vals = ang_vis_plot[np.isfinite(ang_vis_plot)]
+        if len(valid_vals) > 0:
+            data_range = max(abs(np.nanmin(valid_vals)), abs(np.nanmax(valid_vals)))
+            auto_ylim = max(10.0, data_range * 1.2)  # 至少 ±10°
+            ax_a.set_ylim(-auto_ylim, +auto_ylim)
     ax_a.grid(True, linestyle="--", alpha=0.4)
     ax_a.legend(loc="best")
 
