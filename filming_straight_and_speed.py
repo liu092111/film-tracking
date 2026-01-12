@@ -619,6 +619,10 @@ def main():
     ax_pos.set_title("Position (Trajectory)")
     ax_pos.grid(True, linestyle="--", alpha=0.4)
     ax_pos.legend(loc="best")
+    
+    # Y 軸刻度標籤除以二（只改變顯示數值，不改變圖形）
+    from matplotlib.ticker import FuncFormatter
+    ax_pos.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f'{y/2:.0f}'))
 
     plot_pos_path = os.path.join(output_dir, f"{OUT_PREFIX}_position.png")
     figA.savefig(plot_pos_path, dpi=220)
@@ -797,6 +801,10 @@ def main():
     ax_contour.set_title("Center Trajectory with 8 Time Points")
     ax_contour.grid(True, linestyle="--", alpha=0.4)
     ax_contour.legend(loc="best")
+    
+    # Y 軸刻度標籤除以二（只改變顯示數值，不改變圖形）
+    from matplotlib.ticker import FuncFormatter
+    ax_contour.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f'{y/2:.0f}'))
     
     plot_contour_path = os.path.join(output_dir, f"{OUT_PREFIX}_trajectory_center_only.png")
     figC.savefig(plot_contour_path, dpi=220)
