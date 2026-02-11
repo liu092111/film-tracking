@@ -483,11 +483,12 @@ def main():
         ax_pos.set_xlim(xc-half, xc+half); ax_pos.set_ylim(yc-half, yc+half)
     if INVERT_Y_AXIS: ax_pos.invert_yaxis()
     ax_pos.set_aspect("equal", adjustable="box")
-    ax_pos.set_xlabel("x (mm)"); ax_pos.set_ylabel("y (mm)")
-    ax_pos.set_title("Position (Trajectory)")
-    ax_pos.grid(True, linestyle="--", alpha=0.4); ax_pos.legend(loc="best")
+    ax_pos.set_xlabel("x (mm)", fontsize=24); ax_pos.set_ylabel("y (mm)", fontsize=24)
+    ax_pos.set_title("Position (Trajectory)", fontsize=22)
+    #ax_pos.grid(True, linestyle="--", alpha=0.4); ax_pos.legend(loc="best")
+    ax_pos.legend(loc="best", fontsize=14)
     plot_pos_path = os.path.join(output_dir, f"{OUT_PREFIX}_position.png")
-    figA.savefig(plot_pos_path, dpi=220); plt.close(figA)
+    figA.savefig(plot_pos_path, dpi=1200, bbox_inches='tight', pad_inches=0.3); plt.close(figA)
 
     # B) 第二張圖
     if MODE.lower() == "straight":
@@ -500,8 +501,9 @@ def main():
             i_max = np.nanargmax(sp_all)
             ax_s.plot([tt[i_max]],[sp_all[i_max]], marker="o", markersize=8, color="red",
                       label=f"Max: {sp_all[i_max]:.2f} mm/s @ {tt[i_max]:.2f}s")
-        ax_s.set_xlabel("Time (s)"); ax_s.set_ylabel("Speed (mm/s)")
-        ax_s.set_title("Speed vs Time"); ax_s.grid(True, linestyle="--", alpha=0.4); ax_s.legend(loc="best")
+        ax_s.set_xlabel("Time (s)", fontsize=24); ax_s.set_ylabel("Speed (mm/s)", fontsize=24)
+        ax_s.set_title("Speed vs Time", fontsize=22); #ax_s.grid(True, linestyle="--", alpha=0.4); ax_s.legend(loc="best")
+        ax_s.legend(loc="best", fontsize=14)
 
         # 右：Orientation + Avg offset in legend
         if ORIENT_PLOT_WRAPPED: ang_vis = wrap_angles_deg(df["angle_deg_unwrapped"].to_numpy())
@@ -515,14 +517,15 @@ def main():
             avg_offset_deg = float("nan")
         label_orient = f"Orientation (deg)\nAvg offset: {avg_offset_deg:.2f}°" if np.isfinite(avg_offset_deg) else "Orientation (deg)"
         ax_a.plot(df["t_s"], ang_vis, lw=2, label=label_orient)
-        ax_a.set_xlabel("Time (s)"); ax_a.set_ylabel("Angle (deg)")
-        ax_a.set_title("Orientation vs Time")
+        ax_a.set_xlabel("Time (s)", fontsize=24); ax_a.set_ylabel("Angle (deg)", fontsize=24)
+        ax_a.set_title("Orientation vs Time", fontsize=22)
         if ORIENT_YLIM_DEG is not None and np.isfinite(ORIENT_YLIM_DEG):
             ylim = float(ORIENT_YLIM_DEG); ax_a.set_ylim(-ylim, +ylim)
-        ax_a.grid(True, linestyle="--", alpha=0.4); ax_a.legend(loc="best")
+        #ax_a.grid(True, linestyle="--", alpha=0.4); ax_a.legend(loc="best")
+        ax_a.legend(loc="best", fontsize=14)
 
         plot_so_path = os.path.join(output_dir, f"{OUT_PREFIX}_speed_orientation.png")
-        figB.savefig(plot_so_path, dpi=220); plt.close(figB)
+        figB.savefig(plot_so_path, dpi=1200, bbox_inches='tight', pad_inches=0.3); plt.close(figB)
     else:
         figW, ax_w = plt.subplots(1, 1, figsize=(8, 6), constrained_layout=True)
         ax_w.plot(df["t_s"], df["angular_vel_dps"], lw=2, label="Angular speed (deg/s)")
@@ -533,11 +536,12 @@ def main():
             i_max = idxs[idx_rel]
             ax_w.plot([tt[i_max]],[w_all[i_max]], marker="o", markersize=8, color="red",
                       label=f"Max: {w_all[i_max]:.2f} deg/s @ {tt[i_max]:.2f}s")
-        ax_w.set_xlabel("Time (s)"); ax_w.set_ylabel("Angular speed (deg/s)")
-        ax_w.set_title("Angular Speed vs Time")
-        ax_w.grid(True, linestyle="--", alpha=0.4); ax_w.legend(loc="best")
+        ax_w.set_xlabel("Time (s)", fontsize=24); ax_w.set_ylabel("Angular speed (deg/s)", fontsize=24)
+        ax_w.set_title("Angular Speed vs Time", fontsize=22)
+        #ax_w.grid(True, linestyle="--", alpha=0.4); ax_w.legend(loc="best")
+        ax_w.legend(loc="best", fontsize=14)
         plot_w_path = os.path.join(output_dir, f"{OUT_PREFIX}_angular_speed.png")
-        figW.savefig(plot_w_path, dpi=220); plt.close(figW)
+        figW.savefig(plot_w_path, dpi=1200, bbox_inches='tight', pad_inches=0.3); plt.close(figW)
 
     # 訊息
     print(f"[輸出] 目錄：{output_dir}")

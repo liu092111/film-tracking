@@ -445,14 +445,14 @@ def main():
     if INVERT_Y_AXIS:
         ax_pos.invert_yaxis()
     ax_pos.set_aspect("equal", adjustable="box")
-    ax_pos.set_xlabel("x (mm)")
-    ax_pos.set_ylabel("y (mm)")
-    ax_pos.set_title("Position (Trajectory)")
-    ax_pos.grid(True, linestyle="--", alpha=0.4)
-    ax_pos.legend(loc="best")
+    ax_pos.set_xlabel("x (mm)", fontsize=24)
+    ax_pos.set_ylabel("y (mm)", fontsize=24)
+    ax_pos.set_title("Position (Trajectory)", fontsize=22)
+    #ax_pos.grid(True, linestyle="--", alpha=0.4)
+    ax_pos.legend(loc="best", fontsize=14)
 
     plot_pos_path = os.path.join(output_dir, f"{OUT_PREFIX}_position.png")
-    figA.savefig(plot_pos_path, dpi=220)
+    figA.savefig(plot_pos_path, dpi=1200, bbox_inches='tight', pad_inches=0.3)
     plt.close(figA)
     print(f"[輸出] 圖片：{plot_pos_path}")
 
@@ -473,14 +473,14 @@ def main():
         ax_w.plot([t_at], [w_max], marker="o", markersize=8, color="red",
                   label=f"Max: {w_max:.2f} deg/s @ {t_at:.2f}s")
 
-    ax_w.set_xlabel("Time (s)")
-    ax_w.set_ylabel("Angular speed (deg/s)")
-    ax_w.set_title("Angular Speed vs Time")
-    ax_w.grid(True, linestyle="--", alpha=0.4)
-    ax_w.legend(loc="best")
+    ax_w.set_xlabel("Time (s)", fontsize=24)
+    ax_w.set_ylabel("Angular speed (deg/s)", fontsize=24)
+    ax_w.set_title("Angular Speed vs Time", fontsize=22)
+    #ax_w.grid(True, linestyle="--", alpha=0.4)
+    ax_w.legend(loc="best", fontsize=14)
 
     plot_w_path = os.path.join(output_dir, f"{OUT_PREFIX}_angular_speed.png")
-    figW.savefig(plot_w_path, dpi=220)
+    figW.savefig(plot_w_path, dpi=1200, bbox_inches='tight', pad_inches=0.3)
     plt.close(figW)
     print(f"[輸出] 圖片：{plot_w_path}")
 
@@ -501,17 +501,17 @@ def main():
         
         # 計算總旋轉角度
         total_rotation = theta_valid[-1] - theta_valid[0]
-        ax_theta.set_title(f"Theta (Angle) vs Time (Total rotation: {total_rotation:.2f}°)")
+        ax_theta.set_title(f"Theta (Angle) vs Time (Total rotation: {total_rotation:.2f}°)", fontsize=22)
     else:
-        ax_theta.set_title("Theta (Angle) vs Time")
+        ax_theta.set_title("Theta (Angle) vs Time", fontsize=22)
 
-    ax_theta.set_xlabel("Time (s)")
-    ax_theta.set_ylabel("θ (deg)")
-    ax_theta.grid(True, linestyle="--", alpha=0.4)
-    ax_theta.legend(loc="best")
+    ax_theta.set_xlabel("Time (s)", fontsize=24)
+    ax_theta.set_ylabel("θ (deg)", fontsize=24)
+    #ax_theta.grid(True, linestyle="--", alpha=0.4)
+    ax_theta.legend(loc="best", fontsize=14)
 
     plot_theta_path = os.path.join(output_dir, f"{OUT_PREFIX}_theta_vs_time.png")
-    figTheta.savefig(plot_theta_path, dpi=220)
+    figTheta.savefig(plot_theta_path, dpi=1200, bbox_inches='tight', pad_inches=0.3)
     plt.close(figTheta)
     print(f"[輸出] 圖片：{plot_theta_path}")
 
@@ -608,14 +608,14 @@ def main():
         ax_contour.invert_yaxis()
     
     ax_contour.set_aspect("equal", adjustable="box")
-    ax_contour.set_xlabel("x (mm)")
-    ax_contour.set_ylabel("y (mm)")
-    ax_contour.set_title("Center Trajectory with 8 Time Points")
-    ax_contour.grid(True, linestyle="--", alpha=0.4)
-    ax_contour.legend(loc="best")
+    ax_contour.set_xlabel("x (mm)", fontsize=24)
+    ax_contour.set_ylabel("y (mm)", fontsize=24)
+    ax_contour.set_title("Center Trajectory with 8 Time Points", fontsize=22)
+    #ax_contour.grid(True, linestyle="--", alpha=0.4)
+    ax_contour.legend(loc="best", fontsize=14)
     
     plot_contour_path = os.path.join(output_dir, f"{OUT_PREFIX}_trajectory_center_only.png")
-    figC.savefig(plot_contour_path, dpi=220)
+    figC.savefig(plot_contour_path, dpi=1200, bbox_inches='tight', pad_inches=0.3)
     plt.close(figC)
     print(f"[輸出] 圖片（八等分輪廓）：{plot_contour_path}")
 

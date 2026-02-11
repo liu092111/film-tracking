@@ -614,18 +614,18 @@ def main():
     if INVERT_Y_AXIS:
         ax_pos.invert_yaxis()
     ax_pos.set_aspect("equal", adjustable="box")
-    ax_pos.set_xlabel("x (mm)")
-    ax_pos.set_ylabel("y (mm)")
-    ax_pos.set_title("Position (Trajectory)")
-    ax_pos.grid(True, linestyle="--", alpha=0.4)
-    ax_pos.legend(loc="best")
+    ax_pos.set_xlabel("x (mm)", fontsize=24)
+    ax_pos.set_ylabel("y (mm)", fontsize=24)
+    ax_pos.set_title("Position (Trajectory)", fontsize=22)
+    #ax_pos.grid(True, linestyle="--", alpha=0.4)
+    ax_pos.legend(loc="best", fontsize=14)
     
     # Y 軸刻度標籤除以二（只改變顯示數值，不改變圖形）
     from matplotlib.ticker import FuncFormatter
     ax_pos.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f'{y/2:.0f}'))
 
     plot_pos_path = os.path.join(output_dir, f"{OUT_PREFIX}_position.png")
-    figA.savefig(plot_pos_path, dpi=220)
+    figA.savefig(plot_pos_path, dpi=1200, bbox_inches='tight', pad_inches=0.3)
     plt.close(figA)
     print(f"[輸出] 圖片：{plot_pos_path}")
 
@@ -648,11 +648,11 @@ def main():
         ax_s.plot([t_at_max], [max_sp], marker="o", markersize=8, color="red",
                   label=f"Max: {max_sp:.2f} mm/s @ {t_at_max:.2f}s")
 
-    ax_s.set_xlabel("Time (s)")
-    ax_s.set_ylabel("Speed (mm/s)")
-    ax_s.set_title("Speed vs Time")
-    ax_s.grid(True, linestyle="--", alpha=0.4)
-    ax_s.legend(loc="best")
+    ax_s.set_xlabel("Time (s)", fontsize=24)
+    ax_s.set_ylabel("Speed (mm/s)", fontsize=24)
+    ax_s.set_title("Speed vs Time", fontsize=22)
+    #ax_s.grid(True, linestyle="--", alpha=0.4)
+    ax_s.legend(loc="best", fontsize=14)
 
     # 右：Orientation（直接使用 raw 角度計算偏移量，更準確）
     angle_raw_arr = df["angle_deg_raw"].to_numpy()
@@ -684,9 +684,9 @@ def main():
         label_orient = "Orientation offset (deg)"
 
     ax_a.plot(df["t_s"], ang_vis_plot, lw=2, label=label_orient)
-    ax_a.set_xlabel("Time (s)")
-    ax_a.set_ylabel("Angle offset from start (deg)")
-    ax_a.set_title(f"Orientation vs Time (start: {first_angle:.1f}°)")
+    ax_a.set_xlabel("Time (s)", fontsize=24)
+    ax_a.set_ylabel("Angle offset from start (deg)", fontsize=24)
+    ax_a.set_title(f"Orientation vs Time (start: {first_angle:.1f}°)", fontsize=22)
     
     # 自動設定 Y 軸範圍，基於實際數據
     if ORIENT_YLIM_DEG is not None and np.isfinite(ORIENT_YLIM_DEG):
@@ -699,11 +699,11 @@ def main():
             data_range = max(abs(np.nanmin(valid_vals)), abs(np.nanmax(valid_vals)))
             auto_ylim = max(10.0, data_range * 1.2)  # 至少 ±10°
             ax_a.set_ylim(-auto_ylim, +auto_ylim)
-    ax_a.grid(True, linestyle="--", alpha=0.4)
-    ax_a.legend(loc="best")
+    #ax_a.grid(True, linestyle="--", alpha=0.4)
+    ax_a.legend(loc="best", fontsize=14)
 
     plot_so_path = os.path.join(output_dir, f"{OUT_PREFIX}_speed_orientation.png")
-    figB.savefig(plot_so_path, dpi=220)
+    figB.savefig(plot_so_path, dpi=1200, bbox_inches='tight', pad_inches=0.3)
     plt.close(figB)
     print(f"[輸出] 圖片：{plot_so_path}")
 
@@ -796,18 +796,18 @@ def main():
         ax_contour.invert_yaxis()
     
     ax_contour.set_aspect("equal", adjustable="box")
-    ax_contour.set_xlabel("x (mm)")
-    ax_contour.set_ylabel("y (mm)")
-    ax_contour.set_title("Center Trajectory with 8 Time Points")
-    ax_contour.grid(True, linestyle="--", alpha=0.4)
-    ax_contour.legend(loc="best")
+    ax_contour.set_xlabel("x (mm)", fontsize=24)
+    ax_contour.set_ylabel("y (mm)", fontsize=24)
+    #ax_contour.set_title("Center Trajectory with 8 Time Points", fontsize=22)
+    #ax_contour.grid(True, linestyle="--", alpha=0.4)
+    ax_contour.legend(loc="best", fontsize=14)
     
     # Y 軸刻度標籤除以二（只改變顯示數值，不改變圖形）
     from matplotlib.ticker import FuncFormatter
     ax_contour.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f'{y/2:.0f}'))
     
     plot_contour_path = os.path.join(output_dir, f"{OUT_PREFIX}_trajectory_center_only.png")
-    figC.savefig(plot_contour_path, dpi=220)
+    figC.savefig(plot_contour_path, dpi=1200, bbox_inches='tight', pad_inches=0.3)
     plt.close(figC)
     print(f"[輸出] 圖片（八等分輪廓）：{plot_contour_path}")
 
